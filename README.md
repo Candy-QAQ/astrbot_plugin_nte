@@ -1,0 +1,2 @@
+# astrbot_plugin_nte
+astrbot插件异环塔吉多自动签到
