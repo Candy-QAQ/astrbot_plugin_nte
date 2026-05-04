@@ -1,0 +1,6 @@
+name: astrbot_plugin_nte
+display_name: 异环签到
+desc: 异环自动签到，支持手机号密码与手机号验证码登录，支持定时签到
+version: v1.0.4
+author: Candy
+repo: https://github.com/Candy-QAQ/astrbot_plugin_nte

@@ -1,0 +1,26 @@
+{
+  "auto_sign_enabled": {
+    "description": "自动签到开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后将在设定时间自动为已绑定用户签到，并私发结果"
+  },
+  "auto_sign_hour": {
+    "description": "自动签到时间（小时）",
+    "type": "int",
+    "default": 9,
+    "hint": "范围 0-23，表示每天几点执行自动签到"
+  },
+  "auto_sign_delay": {
+    "description": "自动签到随机延迟",
+    "type": "int",
+    "default": 10,
+    "hint": "每个用户签到前随机延迟 0~N 秒，0 表示不延迟"
+  },
+  "max_users": {
+    "description": "最大绑定用户数",
+    "type": "int",
+    "default": 20,
+    "hint": "限制可绑定账号数量，0 表示不限制"
+  }
+}
