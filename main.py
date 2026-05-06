@@ -31,7 +31,7 @@ PHONE_RE = re.compile(r"^1\d{10}$")
 COMMAND_TEXT_RE = re.compile(r"^/?(nte|ntepw|nteph|ntelogout|ntehelp)(\s|$)", re.IGNORECASE)
 
 
-@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.0.4")
+@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.0.0")
 class NTEPlugin(Star):
     """异环签到插件"""
 
