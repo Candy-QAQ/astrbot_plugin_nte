@@ -11,6 +11,12 @@
     "default": 9,
     "hint": "范围 0-23，表示每天几点执行自动签到"
   },
+  "auto_sign_minute": {
+    "description": "自动签到时间（分钟）",
+    "type": "int",
+    "default": 0,
+    "hint": "范围 0-59，表示每天在设定小时的第几分钟执行自动签到"
+  },
   "auto_sign_delay": {
     "description": "自动签到随机延迟",
     "type": "int",
