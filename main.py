@@ -318,9 +318,10 @@ class NTEPlugin(Star):
             "1. /ntepw <手机号> -> 下一条私聊消息发送密码完成登录\n"
             "2. /nteph <手机号> -> 获取验证码后，下一条私聊消息发送验证码完成登录\n"
             "3. /nte 立即签到全部已绑定账号\n"
-            "4. /ntelist 查看当前绑定账号\n"
-            "5. /ntelogout 解除全部绑定\n"
-            "6. /ntelogout <序号> 删除指定账号绑定"
+            "4. /nte <序号> 只签到指定账号\n"
+            "5. /ntelist 查看当前绑定账号\n"
+            "6. /ntelogout 解除全部绑定\n"
+            "7. /ntelogout <序号> 删除指定账号绑定"
         )
 
     @filter.command("ntelist")
@@ -557,7 +558,7 @@ class NTEPlugin(Star):
         yield event.plain_result(message if changed else "你当前没有绑定账号")
 
     @filter.command("nte")
-    async def nte_sign(self, event: AstrMessageEvent):
+    async def nte_sign(self, event: AstrMessageEvent, index: str = ""):
         if not self._is_private(event):
             yield event.plain_result("请在私聊中使用 /nte 签到")
             return
@@ -583,18 +584,39 @@ class NTEPlugin(Star):
             yield event.plain_result("你还未绑定账号，请先使用 /ntepw 或 /nteph 登录")
             return
 
-        yield event.plain_result(f"正在签到，请稍候...（共 {len(accounts)} 个账号）")
+        target_indexes = list(range(len(accounts)))
+        index = str(index or "").strip()
+        if index:
+            if not index.isdigit():
+                yield event.plain_result("序号格式错误，请使用 /nte 1")
+                return
+            target = int(index)
+            if target < 1 or target > len(accounts):
+                yield event.plain_result(f"序号超出范围，当前共有 {len(accounts)} 个账号。发送 /ntelist 查看列表")
+                return
+            target_indexes = [target - 1]
+
+        if len(target_indexes) == 1 and index:
+            yield event.plain_result(
+                f"正在签到第 {target_indexes[0] + 1} 个账号，请稍候...\n"
+                f"{self._format_account_brief(accounts[target_indexes[0]], target_indexes[0] + 1)}"
+            )
+        else:
+            yield event.plain_result(f"正在签到，请稍候...（共 {len(accounts)} 个账号）")
+
         all_ok = True
         summaries: list[str] = []
-        for index, entry in enumerate(accounts, start=1):
+        for target_index in target_indexes:
+            entry = accounts[target_index]
+            account_number = target_index + 1
             try:
                 ok, details = await self._do_sign_for_account(entry)
                 all_ok = all_ok and ok
                 detail_text = "\n".join(details[:12]) if details else "无详细信息"
-                summaries.append(f"【账号 {index}】\n{detail_text}")
+                summaries.append(f"【账号 {account_number}】\n{detail_text}")
             except Exception as e:
                 all_ok = False
-                summaries.append(f"【账号 {index}】\n❌ 签到失败：{str(e)}")
+                summaries.append(f"【账号 {account_number}】\n❌ 签到失败：{str(e)}")
 
         self._store_accounts(user_data, accounts)
         users[user_id] = user_data
