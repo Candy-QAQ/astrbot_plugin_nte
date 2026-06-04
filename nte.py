@@ -280,6 +280,50 @@ def _parse_role_ids(role_text):
     return _dedup_list([i.strip() for i in text.split(',') if i.strip()])
 
 
+def _normalize_role_info(role):
+    if not isinstance(role, dict):
+        return None
+    role_id = str(role.get('roleId') or role.get('role_id') or '').strip()
+    if not role_id:
+        return None
+    normalized = {'roleId': role_id}
+    role_name = str(role.get('roleName') or role.get('name') or '').strip()
+    if role_name:
+        normalized['roleName'] = role_name
+    server_name = str(role.get('serverName') or '').strip()
+    if server_name:
+        normalized['serverName'] = server_name
+    return normalized
+
+
+def _parse_roles(roles):
+    result = []
+    seen = set()
+    if not isinstance(roles, list):
+        return result
+    for item in roles:
+        role = _normalize_role_info(item)
+        if not role:
+            continue
+        role_id = role['roleId']
+        if role_id in seen:
+            continue
+        result.append(role)
+        seen.add(role_id)
+    return result
+
+
+def _role_label(role_id, roles=None):
+    role_id = str(role_id or '').strip()
+    for role in _parse_roles(roles):
+        if role.get('roleId') != role_id:
+            continue
+        role_name = str(role.get('roleName') or '').strip()
+        if role_name:
+            return f'角色{role_name}({role_id})'
+    return f'角色{role_id}'
+
+
 def _safe_json(response, endpoint):
     if not response.text.strip():
         raise Exception(f'{endpoint} 返回空响应，status={response.status_code}')
@@ -340,7 +384,11 @@ def parse_account_line(line):
         raw.get('cloudDeviceId') or raw.get('cloud_device_id') or cloud_raw.get('deviceId') or ''
     ).strip() or device_id
     game_id = str(raw.get('gameId') or raw.get('game_id') or _default_game_id()).strip() or _default_game_id()
-    role_ids = _parse_role_ids(raw.get('roleIds') or raw.get('role_ids') or raw.get('roleId'))
+    roles = _parse_roles(raw.get('roles'))
+    role_ids = _dedup_list(
+        _parse_role_ids(raw.get('roleIds') or raw.get('role_ids') or raw.get('roleId'))
+        + [role['roleId'] for role in roles]
+    )
     account = {
         'refreshToken': refresh_token,
         'uid': uid,
@@ -354,6 +402,8 @@ def parse_account_line(line):
         account['cloudUserId'] = cloud_user_id
     if cloud_token or cloud_user_id:
         account['cloudDeviceId'] = cloud_device_id
+    if roles:
+        account['roles'] = roles
     return account
 
 
@@ -377,6 +427,9 @@ def _account_to_line(account):
         payload['cloudUserId'] = cloud_user_id
     if cloud_token or cloud_user_id:
         payload['cloudDeviceId'] = account.get('cloudDeviceId') or payload['deviceId']
+    roles = _parse_roles(account.get('roles'))
+    if roles:
+        payload['roles'] = roles
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -735,7 +788,7 @@ def refresh_access_token(account):
     return access_token
 
 
-def get_game_role_ids(access_token, uid, device_id, game_id):
+def get_game_roles_info(access_token, uid, device_id, game_id):
     headers = {
         'platform': 'android',
         'authorization': access_token,
@@ -750,12 +803,11 @@ def get_game_role_ids(access_token, uid, device_id, game_id):
         raise Exception(f'获取角色列表失败：{resp.get("msg") or resp}')
     data = resp.get('data') or {}
     roles = data.get('roles', []) if isinstance(data, dict) else []
-    role_ids = []
-    for role in roles:
-        role_id = str(role.get('roleId', '')).strip()
-        if role_id:
-            role_ids.append(role_id)
-    return _dedup_list(role_ids)
+    return _parse_roles(roles)
+
+
+def get_game_role_ids(access_token, uid, device_id, game_id):
+    return _dedup_list([role['roleId'] for role in get_game_roles_info(access_token, uid, device_id, game_id)])
 
 
 def app_signin(access_token, uid, device_id):
@@ -1016,12 +1068,14 @@ def _build_account_from_user_center(user_center, device_id):
         'roleIds': [],
     }
     try:
-        account['roleIds'] = get_game_role_ids(
+        roles = get_game_roles_info(
             user_center['accessToken'],
             account['uid'],
             device_id,
             account['gameId'],
         )
+        account['roles'] = roles
+        account['roleIds'] = _dedup_list([role['roleId'] for role in roles])
     except Exception as ex:
         print(f'自动获取角色ID失败：{ex}')
     return account
@@ -1215,9 +1269,18 @@ def do_sign(account):
         env_role_ids = _parse_role_ids(role_ids_env)
         if env_role_ids:
             role_ids = _dedup_list(role_ids + env_role_ids)
-        if not role_ids and uid:
-            role_ids = get_game_role_ids(access_token, uid, account['deviceId'], account['gameId'])
+        roles = _parse_roles(account.get('roles'))
+        if uid:
+            try:
+                latest_roles = get_game_roles_info(access_token, uid, account['deviceId'], account['gameId'])
+                if latest_roles:
+                    roles = latest_roles
+                    role_ids = _dedup_list(role_ids + [role['roleId'] for role in latest_roles])
+            except Exception as ex:
+                logging.warning(f'刷新角色列表失败：{ex}')
         account['roleIds'] = role_ids
+        if roles:
+            account['roles'] = roles
 
         if not role_ids:
             print('未找到角色ID，请设置 TGD_ROLE_IDS 或重新登录以自动拉取角色。')
@@ -1225,19 +1288,18 @@ def do_sign(account):
 
         for role_id in role_ids:
             ok, message = game_signin(access_token, role_id, account['gameId'])
+            role_label = _role_label(role_id, roles)
             if ok:
-                role_msg = f'角色{role_id}签到成功：{message}'
+                role_msg = f'{role_label}签到成功：{message}'
                 print(role_msg)
                 logging.info(role_msg)
             else:
-                role_msg = f'角色{role_id}签到失败：{message}'
+                role_msg = f'{role_label}签到失败：{message}'
                 print(role_msg)
                 logging.warning(role_msg)
                 success = False
     else:
-        skip_msg = '当前账号没有 refreshToken，跳过塔吉多社区/游戏签到。'
-        print(skip_msg)
-        logging.info(skip_msg)
+        logging.info('当前账号没有 refreshToken，跳过塔吉多社区/游戏签到。')
 
     if has_cloud:
         cloud_ok, cloud_msg = cloud_claim_daily_duration(account)

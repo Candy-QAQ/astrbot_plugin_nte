@@ -184,7 +184,7 @@ class NTEPlugin(Star):
                     }
                 )
         if normalized:
-            return normalized
+            return self._merge_accounts_by_phone(normalized)
 
         legacy_account = copy.deepcopy(user_data.get("account") or {})
         if self._has_usable_credentials(legacy_account):
@@ -224,6 +224,7 @@ class NTEPlugin(Star):
         return "tajiduo"
 
     def _store_accounts(self, user_data: dict, accounts: list[dict]):
+        accounts = self._merge_accounts_by_phone(accounts)
         user_data["accounts"] = accounts
         if accounts:
             latest = accounts[-1]
@@ -237,13 +238,77 @@ class NTEPlugin(Star):
             user_data.pop("bound_at", None)
             user_data.pop("last_sign_at", None)
 
+    def _merge_account_entries(self, base_entry: dict, incoming_entry: dict) -> dict:
+        base = copy.deepcopy(base_entry or {})
+        incoming = copy.deepcopy(incoming_entry or {})
+        base_account = base.get("account") or {}
+        incoming_account = incoming.get("account") or {}
+
+        merged_account = copy.deepcopy(base_account)
+        for key, value in incoming_account.items():
+            if value in (None, "", []):
+                continue
+            if key == "roleIds":
+                merged_account[key] = nte._dedup_list((merged_account.get(key) or []) + value)
+                continue
+            if key == "roles":
+                existing_roles = merged_account.get("roles") or []
+                merged_account[key] = self._merge_role_lists(existing_roles, value)
+                continue
+            merged_account[key] = value
+
+        base["account"] = merged_account
+        base["kind"] = self._account_kind(merged_account)
+        if incoming.get("phone"):
+            base["phone"] = incoming.get("phone")
+        elif not base.get("phone"):
+            base["phone"] = ""
+        base["bound_at"] = base.get("bound_at") or incoming.get("bound_at") or datetime.now().isoformat()
+        base["last_sign_at"] = incoming.get("last_sign_at") or base.get("last_sign_at")
+        return base
+
+    @staticmethod
+    def _merge_role_lists(left: list, right: list) -> list:
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for source in (left or [], right or []):
+            if not isinstance(source, dict):
+                continue
+            role_id = str(source.get("roleId") or source.get("role_id") or "").strip()
+            if not role_id or role_id in seen:
+                continue
+            role = {"roleId": role_id}
+            role_name = str(source.get("roleName") or source.get("name") or "").strip()
+            if role_name:
+                role["roleName"] = role_name
+            server_name = str(source.get("serverName") or "").strip()
+            if server_name:
+                role["serverName"] = server_name
+            merged.append(role)
+            seen.add(role_id)
+        return merged
+
+    def _merge_accounts_by_phone(self, accounts: list[dict]) -> list[dict]:
+        merged: list[dict] = []
+        for entry in accounts:
+            phone = str(entry.get("phone") or "").strip()
+            if phone:
+                existing_idx = next(
+                    (idx for idx, item in enumerate(merged) if str(item.get("phone") or "").strip() == phone),
+                    None,
+                )
+                if existing_idx is not None:
+                    merged[existing_idx] = self._merge_account_entries(merged[existing_idx], entry)
+                    continue
+            merged.append(entry)
+        return merged
+
     def _upsert_account(self, accounts: list[dict], new_entry: dict) -> tuple[str, int]:
         new_account = new_entry.get("account") or {}
         new_uid = str(new_account.get("uid") or "").strip()
         new_cloud_uid = str(new_account.get("cloudUserId") or "").strip()
         new_game_id = str(new_account.get("gameId") or "").strip()
         new_phone = str(new_entry.get("phone") or "").strip()
-        new_kind = str(new_entry.get("kind") or self._account_kind(new_account))
 
         for idx, item in enumerate(accounts):
             account = item.get("account") or {}
@@ -251,15 +316,14 @@ class NTEPlugin(Star):
             cloud_uid = str(account.get("cloudUserId") or "").strip()
             game_id = str(account.get("gameId") or "").strip()
             phone = str(item.get("phone") or "").strip()
-            kind = str(item.get("kind") or self._account_kind(account))
+            if new_phone and phone == new_phone:
+                accounts[idx] = self._merge_account_entries(item, new_entry)
+                return "updated", idx
             if new_uid and uid == new_uid and new_game_id and game_id == new_game_id:
-                accounts[idx] = new_entry
+                accounts[idx] = self._merge_account_entries(item, new_entry)
                 return "updated", idx
             if new_cloud_uid and cloud_uid == new_cloud_uid:
-                accounts[idx] = new_entry
-                return "updated", idx
-            if new_phone and phone == new_phone and kind == new_kind:
-                accounts[idx] = new_entry
+                accounts[idx] = self._merge_account_entries(item, new_entry)
                 return "updated", idx
 
         accounts.append(new_entry)
@@ -271,16 +335,13 @@ class NTEPlugin(Star):
         kind_text = {"tajiduo": "塔吉多", "cloud": "云异环", "both": "塔吉多+云异环"}.get(kind, kind)
         uid = str(account.get("uid") or "").strip()
         cloud_uid = str(account.get("cloudUserId") or "").strip()
-        game_id = str(account.get("gameId") or "?")
-        role_count = len(account.get("roleIds") or [])
         phone = str(entry.get("phone") or "").strip()
         phone_tail = phone[-4:] if len(phone) >= 4 else phone
-        parts = [f"{index}. 类型={kind_text}"]
+        parts = [f"类型={kind_text}"]
         if uid:
             parts.append(f"uid={uid}")
         if cloud_uid:
             parts.append(f"cloudUid={cloud_uid}")
-        parts.extend([f"gameId={game_id}", f"角色={role_count}"])
         if phone_tail:
             parts.append(f"手机号尾号={phone_tail}")
         last_sign_at = entry.get("last_sign_at")
