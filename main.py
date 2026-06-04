@@ -4,6 +4,7 @@ AstrBot Plugin - 异环签到 (NTE Auto Sign)
 Commands:
 - ntepw <手机号> (private): 输入手机号后，下一条私聊消息输入密码完成登录
 - nteph <手机号> (private): 获取验证码后，下一条私聊消息输入验证码完成登录
+- nteyun <手机号> (private): 获取云异环验证码后，下一条私聊消息输入验证码完成登录
 - nte (private): 立即签到
 - ntelist (private): 查看当前已绑定账号
 - ntelogout (private): 解除绑定
@@ -29,10 +30,13 @@ from . import nte
 PLUGIN_NAME = "astrbot_plugin_nte"
 PENDING_EXPIRE_SECONDS = 600
 PHONE_RE = re.compile(r"^1\d{10}$")
-COMMAND_TEXT_RE = re.compile(r"^/?(nte|ntepw|nteph|ntelist|ntelogout|ntehelp)(\s|$)", re.IGNORECASE)
+COMMAND_TEXT_RE = re.compile(
+    r"^/?(nte|ntepw|nteph|nteyun|ntelist|ntelogout|ntehelp)(\s|$)",
+    re.IGNORECASE,
+)
 
 
-@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.0.0")
+@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.0")
 class NTEPlugin(Star):
     """异环签到插件"""
 
@@ -73,10 +77,10 @@ class NTEPlugin(Star):
         )
         put_config(
             namespace=PLUGIN_NAME,
-            name="最大绑定用户数",
+            name="最大绑定聊天用户数",
             key="max_users",
             value=20,
-            description="0 为不限制，超过限制则不允许新用户绑定",
+            description="0 为不限制；单个聊天用户可绑定多个账号",
         )
 
     def _get_config(self) -> dict:
@@ -168,12 +172,13 @@ class NTEPlugin(Star):
                 if not isinstance(item, dict):
                     continue
                 account = copy.deepcopy(item.get("account") or {})
-                if not account or not account.get("refreshToken"):
+                if not self._has_usable_credentials(account):
                     continue
                 normalized.append(
                     {
                         "account": account,
                         "phone": str(item.get("phone", "")).strip(),
+                        "kind": item.get("kind") or self._account_kind(account),
                         "bound_at": item.get("bound_at") or datetime.now().isoformat(),
                         "last_sign_at": item.get("last_sign_at"),
                     }
@@ -182,16 +187,41 @@ class NTEPlugin(Star):
             return normalized
 
         legacy_account = copy.deepcopy(user_data.get("account") or {})
-        if legacy_account and legacy_account.get("refreshToken"):
+        if self._has_usable_credentials(legacy_account):
             return [
                 {
                     "account": legacy_account,
                     "phone": str(user_data.get("phone", "")).strip(),
+                    "kind": self._account_kind(legacy_account),
                     "bound_at": user_data.get("bound_at") or datetime.now().isoformat(),
                     "last_sign_at": user_data.get("last_sign_at"),
                 }
             ]
         return []
+
+    @staticmethod
+    def _has_usable_credentials(account: dict) -> bool:
+        if not isinstance(account, dict) or not account:
+            return False
+        if str(account.get("refreshToken") or "").strip():
+            return True
+        return bool(
+            str(account.get("cloudToken") or "").strip()
+            and str(account.get("cloudUserId") or "").strip()
+        )
+
+    @staticmethod
+    def _account_kind(account: dict) -> str:
+        has_tajiduo = bool(str(account.get("refreshToken") or "").strip())
+        has_cloud = bool(
+            str(account.get("cloudToken") or "").strip()
+            and str(account.get("cloudUserId") or "").strip()
+        )
+        if has_tajiduo and has_cloud:
+            return "both"
+        if has_cloud:
+            return "cloud"
+        return "tajiduo"
 
     def _store_accounts(self, user_data: dict, accounts: list[dict]):
         user_data["accounts"] = accounts
@@ -210,18 +240,25 @@ class NTEPlugin(Star):
     def _upsert_account(self, accounts: list[dict], new_entry: dict) -> tuple[str, int]:
         new_account = new_entry.get("account") or {}
         new_uid = str(new_account.get("uid") or "").strip()
+        new_cloud_uid = str(new_account.get("cloudUserId") or "").strip()
         new_game_id = str(new_account.get("gameId") or "").strip()
         new_phone = str(new_entry.get("phone") or "").strip()
+        new_kind = str(new_entry.get("kind") or self._account_kind(new_account))
 
         for idx, item in enumerate(accounts):
             account = item.get("account") or {}
             uid = str(account.get("uid") or "").strip()
+            cloud_uid = str(account.get("cloudUserId") or "").strip()
             game_id = str(account.get("gameId") or "").strip()
             phone = str(item.get("phone") or "").strip()
+            kind = str(item.get("kind") or self._account_kind(account))
             if new_uid and uid == new_uid and new_game_id and game_id == new_game_id:
                 accounts[idx] = new_entry
                 return "updated", idx
-            if new_phone and phone == new_phone and uid == new_uid:
+            if new_cloud_uid and cloud_uid == new_cloud_uid:
+                accounts[idx] = new_entry
+                return "updated", idx
+            if new_phone and phone == new_phone and kind == new_kind:
                 accounts[idx] = new_entry
                 return "updated", idx
 
@@ -230,19 +267,30 @@ class NTEPlugin(Star):
 
     def _format_account_brief(self, entry: dict, index: int) -> str:
         account = entry.get("account") or {}
-        uid = str(account.get("uid") or "?")
+        kind = str(entry.get("kind") or self._account_kind(account))
+        kind_text = {"tajiduo": "塔吉多", "cloud": "云异环", "both": "塔吉多+云异环"}.get(kind, kind)
+        uid = str(account.get("uid") or "").strip()
+        cloud_uid = str(account.get("cloudUserId") or "").strip()
         game_id = str(account.get("gameId") or "?")
         role_count = len(account.get("roleIds") or [])
         phone = str(entry.get("phone") or "").strip()
         phone_tail = phone[-4:] if len(phone) >= 4 else phone
-        parts = [f"{index}. uid={uid}", f"gameId={game_id}", f"角色={role_count}"]
+        parts = [f"{index}. 类型={kind_text}"]
+        if uid:
+            parts.append(f"uid={uid}")
+        if cloud_uid:
+            parts.append(f"cloudUid={cloud_uid}")
+        parts.extend([f"gameId={game_id}", f"角色={role_count}"])
         if phone_tail:
             parts.append(f"手机号尾号={phone_tail}")
+        last_sign_at = entry.get("last_sign_at")
+        if last_sign_at:
+            parts.append(f"上次签到={str(last_sign_at)[:19]}")
         return " | ".join(parts)
 
     async def _do_sign_for_account(self, entry: dict) -> tuple[bool, list[str]]:
         account = copy.deepcopy(entry.get("account") or {})
-        if not account or not account.get("refreshToken"):
+        if not self._has_usable_credentials(account):
             raise Exception("账号数据缺失，请重新登录")
 
         def _run_sign():
@@ -276,17 +324,18 @@ class NTEPlugin(Star):
             summaries: list[str] = []
             all_ok = True
             for index, entry in enumerate(accounts, start=1):
+                account_brief = self._format_account_brief(entry, index)
                 if max_delay > 0:
                     await asyncio.sleep(random.uniform(0, max_delay))
                 try:
                     ok, details = await self._do_sign_for_account(entry)
                     all_ok = all_ok and ok
                     detail_text = "\n".join(details[:8]) if details else "无详细信息"
-                    summaries.append(f"【账号 {index}】\n{detail_text}")
+                    summaries.append(f"【账号 {index}】\n{account_brief}\n{detail_text}")
                 except Exception as e:
                     all_ok = False
                     logger.error(f"用户 {user_id} 的第 {index} 个账号自动签到失败: {e}")
-                    summaries.append(f"【账号 {index}】\n❌ 失败：{str(e)}")
+                    summaries.append(f"【账号 {index}】\n{account_brief}\n❌ 失败：{str(e)}")
 
             self._store_accounts(user_data, accounts)
             users[user_id] = user_data
@@ -317,11 +366,12 @@ class NTEPlugin(Star):
             "异环签到插件帮助\n"
             "1. /ntepw <手机号> -> 下一条私聊消息发送密码完成登录\n"
             "2. /nteph <手机号> -> 获取验证码后，下一条私聊消息发送验证码完成登录\n"
-            "3. /nte 立即签到全部已绑定账号\n"
-            "4. /nte <序号> 只签到指定账号\n"
-            "5. /ntelist 查看当前绑定账号\n"
-            "6. /ntelogout 解除全部绑定\n"
-            "7. /ntelogout <序号> 删除指定账号绑定"
+            "3. /nteyun <手机号> -> 获取云异环验证码后，下一条私聊消息发送验证码完成登录\n"
+            "4. /nte 立即签到全部已绑定账号\n"
+            "5. /nte <序号> 只签到指定账号\n"
+            "6. /ntelist 查看当前绑定账号\n"
+            "7. /ntelogout 解除全部绑定\n"
+            "8. /ntelogout <序号> 删除指定账号绑定"
         )
 
     @filter.command("ntelist")
@@ -339,7 +389,7 @@ class NTEPlugin(Star):
         existing_user_key = self._pick_existing_key(users, user_keys)
         user_data = users.get(existing_user_key) if existing_user_key else None
         if not user_data:
-            yield event.plain_result("你还未绑定账号，请先使用 /ntepw 或 /nteph 登录")
+            yield event.plain_result("你还未绑定账号，请先使用 /ntepw、/nteph 或 /nteyun 登录")
             return
 
         if existing_user_key and existing_user_key != user_id:
@@ -349,7 +399,7 @@ class NTEPlugin(Star):
 
         accounts = self._normalize_accounts(user_data)
         if not accounts:
-            yield event.plain_result("你还未绑定账号，请先使用 /ntepw 或 /nteph 登录")
+            yield event.plain_result("你还未绑定账号，请先使用 /ntepw、/nteph 或 /nteyun 登录")
             return
 
         summaries = "\n".join(self._format_account_brief(item, i) for i, item in enumerate(accounts, start=1))
@@ -420,6 +470,45 @@ class NTEPlugin(Star):
         )
         yield event.plain_result("验证码已发送，请直接回复验证码（10分钟内有效）")
 
+    @filter.command("nteyun")
+    async def nteyun(self, event: AstrMessageEvent, phone: str = ""):
+        if not self._is_private(event):
+            yield event.plain_result("请在私聊中使用 /nteyun 获取验证码，避免泄露隐私")
+            return
+        phone = phone.strip()
+        if not self._valid_phone(phone):
+            yield event.plain_result("手机号格式错误，请使用：/nteyun 13800138000")
+            return
+
+        user_keys = self._build_user_keys(event)
+        if not user_keys:
+            yield event.plain_result("无法识别当前用户，请稍后重试")
+            return
+        user_id = user_keys[0]
+        users = await self.get_kv_data("users", {})
+        config = self._get_config()
+        max_users = int(config.get("max_users", 20))
+        existing_key = self._pick_existing_key(users, user_keys)
+        if existing_key is None and max_users > 0 and len(users) >= max_users:
+            yield event.plain_result(f"❌ 绑定失败：已达到最大用户数限制（{max_users}）")
+            return
+
+        try:
+            device_id = await asyncio.to_thread(nte.send_cloud_login_captcha, phone)
+        except Exception as e:
+            yield event.plain_result(f"发送云异环验证码失败：{str(e)}")
+            return
+
+        await self._set_pending(
+            user_id,
+            {
+                "mode": "cloud_sms",
+                "phone": phone,
+                "device_id": device_id,
+            },
+        )
+        yield event.plain_result("云异环验证码已发送，请直接回复验证码（10分钟内有效）")
+
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @filter.regex(r"^[^/].+")
     async def handle_pending_login_input(self, event: AstrMessageEvent):
@@ -437,7 +526,7 @@ class NTEPlugin(Star):
         created_at = int(session.get("created_at", 0))
         if created_at <= 0 or now_ts - created_at > PENDING_EXPIRE_SECONDS:
             await self._clear_pending(pending_key or user_id)
-            yield event.plain_result("登录流程已过期，请重新发送 /ntepw 或 /nteph")
+            yield event.plain_result("登录流程已过期，请重新发送 /ntepw、/nteph 或 /nteyun")
             return
 
         content = event.get_message_str().strip()
@@ -456,9 +545,11 @@ class NTEPlugin(Star):
                 account = await asyncio.to_thread(nte.build_account_by_password, phone, content)
             elif mode == "sms":
                 account = await asyncio.to_thread(nte.build_account_by_sms, phone, content, device_id)
+            elif mode == "cloud_sms":
+                account = await asyncio.to_thread(nte.build_cloud_account_by_sms, phone, content, device_id)
             else:
                 await self._clear_pending(pending_key or user_id)
-                yield event.plain_result("登录状态异常，请重新发送 /ntepw 或 /nteph")
+                yield event.plain_result("登录状态异常，请重新发送 /ntepw、/nteph 或 /nteyun")
                 return
         except Exception as e:
             retry_hint = "可直接重试发送密码" if mode == "password" else "可直接重试发送验证码"
@@ -474,6 +565,7 @@ class NTEPlugin(Star):
         new_entry = {
             "account": account,
             "phone": phone,
+            "kind": self._account_kind(account),
             "bound_at": datetime.now().isoformat(),
             "last_sign_at": None,
         }
@@ -572,7 +664,7 @@ class NTEPlugin(Star):
         existing_user_key = self._pick_existing_key(users, user_keys)
         user_data = users.get(existing_user_key) if existing_user_key else None
         if not user_data:
-            yield event.plain_result("你还未绑定账号，请先使用 /ntepw 或 /nteph 登录")
+            yield event.plain_result("你还未绑定账号，请先使用 /ntepw、/nteph 或 /nteyun 登录")
             return
 
         if existing_user_key and existing_user_key != user_id:
@@ -581,7 +673,7 @@ class NTEPlugin(Star):
 
         accounts = self._normalize_accounts(user_data)
         if not accounts:
-            yield event.plain_result("你还未绑定账号，请先使用 /ntepw 或 /nteph 登录")
+            yield event.plain_result("你还未绑定账号，请先使用 /ntepw、/nteph 或 /nteyun 登录")
             return
 
         target_indexes = list(range(len(accounts)))
@@ -609,14 +701,15 @@ class NTEPlugin(Star):
         for target_index in target_indexes:
             entry = accounts[target_index]
             account_number = target_index + 1
+            account_brief = self._format_account_brief(entry, account_number)
             try:
                 ok, details = await self._do_sign_for_account(entry)
                 all_ok = all_ok and ok
                 detail_text = "\n".join(details[:12]) if details else "无详细信息"
-                summaries.append(f"【账号 {account_number}】\n{detail_text}")
+                summaries.append(f"【账号 {account_number}】\n{account_brief}\n{detail_text}")
             except Exception as e:
                 all_ok = False
-                summaries.append(f"【账号 {account_number}】\n❌ 签到失败：{str(e)}")
+                summaries.append(f"【账号 {account_number}】\n{account_brief}\n❌ 签到失败：{str(e)}")
 
         self._store_accounts(user_data, accounts)
         users[user_id] = user_data
