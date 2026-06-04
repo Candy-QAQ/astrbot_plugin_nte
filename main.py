@@ -349,6 +349,157 @@ class NTEPlugin(Star):
             parts.append(f"上次签到={str(last_sign_at)[:19]}")
         return " | ".join(parts)
 
+    @staticmethod
+    def _display_kind(kind: str) -> str:
+        return {
+            "tajiduo": "塔吉多",
+            "cloud": "云异环",
+            "both": "塔吉多 + 云异环",
+        }.get(kind, kind)
+
+    @staticmethod
+    def _format_datetime_text(value) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "无"
+        return text[:19].replace("T", " ")
+
+    @staticmethod
+    def _format_reward_text(text: str) -> str:
+        text = str(text or "").strip()
+        match = re.fullmatch(r"(.+?)x(\d+)", text)
+        if match:
+            return f"{match.group(1)} ×{match.group(2)}"
+        return text
+
+    @staticmethod
+    def _format_cloud_duration(text: str) -> str:
+        text = str(text or "").strip()
+        if not text or text == "未知":
+            return text or "未知"
+        hour_match = re.search(r"(\d+)小时", text)
+        minute_match = re.search(r"(\d+)分钟", text)
+        hours = int(hour_match.group(1)) if hour_match else 0
+        minutes = int(minute_match.group(1)) if minute_match else 0
+        parts = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or not parts:
+            parts.append(f"{minutes}m")
+        return "".join(parts)
+
+    @staticmethod
+    def _extract_role_display(role_label: str) -> str:
+        text = str(role_label or "").strip()
+        if not text:
+            return "未知角色"
+        if text.startswith("角色"):
+            text = text[2:]
+        match = re.fullmatch(r"(.+?)\((\d+)\)", text)
+        if match:
+            return match.group(1).strip() or f"角色{match.group(2)}"
+        if text.isdigit():
+            return f"角色{text}"
+        return text
+
+    def _parse_detail_lines(self, details: list[str]) -> dict:
+        result = {
+            "community": None,
+            "games": [],
+            "cloud": None,
+            "errors": [],
+            "other": [],
+        }
+
+        for line in details:
+            text = str(line or "").strip()
+            if not text:
+                continue
+
+            community = re.match(r"账号[^：]+：(.+)$", text)
+            if community:
+                message = community.group(1).strip()
+                ok = "失败" not in message
+                if message.startswith("社区"):
+                    message = message[2:].strip()
+                result["community"] = f"社区  {'✅' if ok else '❌'} {message}"
+                continue
+
+            game = re.match(r"(.+?)签到(成功|失败)：(.+)$", text)
+            if game and game.group(1).startswith("角色"):
+                role_name = self._extract_role_display(game.group(1))
+                ok = game.group(2) == "成功"
+                message = game.group(3).strip()
+                reward = ""
+                reward_match = re.search(r"今日道具：([^，；]+)", message)
+                if reward_match:
+                    reward = f" — {self._format_reward_text(reward_match.group(1))}"
+                elif message:
+                    cleaned = re.sub(r"（gameId=[^)]+）", "", message).strip("， ")
+                    reward = f" — {cleaned}" if cleaned else ""
+                result["games"].append(f"游戏  {'✅' if ok else '❌'} {role_name}{reward}")
+                continue
+
+            if text.startswith("云异环时长："):
+                cloud = re.search(
+                    r"剩余([^，]+)，免费([^，]+)，充值([^，]+)(?:，.*?待领取消息(\d+)个)?",
+                    text,
+                )
+                if cloud:
+                    remained = self._format_cloud_duration(cloud.group(1))
+                    free = self._format_cloud_duration(cloud.group(2))
+                    recharge = self._format_cloud_duration(cloud.group(3))
+                    untreated = cloud.group(4) or "0"
+                    result["cloud"] = (
+                        f"云端  ⏱ 剩余 {remained}（免费 {free} / 充值 {recharge}）待领取 {untreated}"
+                    )
+                else:
+                    result["cloud"] = f"云端  ⏱ {text.removeprefix('云异环时长：')}"
+                continue
+
+            if "失败" in text or "失效" in text:
+                result["errors"].append(f"错误  ❌ {text}")
+            else:
+                result["other"].append(text)
+
+        return result
+
+    def _format_sign_result(self, entry: dict, index: int, details: list[str], error: str | None = None) -> str:
+        account = entry.get("account") or {}
+        kind = str(entry.get("kind") or self._account_kind(account))
+        uid = str(account.get("uid") or "").strip()
+        cloud_uid = str(account.get("cloudUserId") or "").strip()
+        phone = str(entry.get("phone") or "").strip()
+        phone_tail = phone[-4:] if len(phone) >= 4 else phone or "未知"
+        identity_label = "UID"
+        identity = uid or cloud_uid or "未知"
+        if not uid and cloud_uid:
+            identity_label = "CloudUID"
+
+        lines = [
+            f"━━━━━━━━━━ 账号 {index} ━━━━━━━━━━",
+            f"类型  {self._display_kind(kind)}",
+            f"{identity_label}   {identity}  |  尾号 {phone_tail}",
+            f"上次签到  {self._format_datetime_text(entry.get('last_sign_at'))}",
+            "",
+        ]
+
+        if error:
+            lines.append(f"错误  ❌ {error}")
+            return "\n".join(lines)
+
+        parsed = self._parse_detail_lines(details)
+        if parsed["community"]:
+            lines.append(parsed["community"])
+        lines.extend(parsed["games"])
+        if parsed["cloud"]:
+            lines.append(parsed["cloud"])
+        lines.extend(parsed["errors"])
+        lines.extend(parsed["other"])
+        if len(lines) == 5:
+            lines.append("详情  无详细信息")
+        return "\n".join(lines)
+
     async def _do_sign_for_account(self, entry: dict) -> tuple[bool, list[str]]:
         account = copy.deepcopy(entry.get("account") or {})
         if not self._has_usable_credentials(account):
@@ -385,18 +536,16 @@ class NTEPlugin(Star):
             summaries: list[str] = []
             all_ok = True
             for index, entry in enumerate(accounts, start=1):
-                account_brief = self._format_account_brief(entry, index)
                 if max_delay > 0:
                     await asyncio.sleep(random.uniform(0, max_delay))
                 try:
                     ok, details = await self._do_sign_for_account(entry)
                     all_ok = all_ok and ok
-                    detail_text = "\n".join(details[:8]) if details else "无详细信息"
-                    summaries.append(f"【账号 {index}】\n{account_brief}\n{detail_text}")
+                    summaries.append(self._format_sign_result(entry, index, details))
                 except Exception as e:
                     all_ok = False
                     logger.error(f"用户 {user_id} 的第 {index} 个账号自动签到失败: {e}")
-                    summaries.append(f"【账号 {index}】\n{account_brief}\n❌ 失败：{str(e)}")
+                    summaries.append(self._format_sign_result(entry, index, [], error=str(e)))
 
             self._store_accounts(user_data, accounts)
             users[user_id] = user_data
@@ -762,15 +911,13 @@ class NTEPlugin(Star):
         for target_index in target_indexes:
             entry = accounts[target_index]
             account_number = target_index + 1
-            account_brief = self._format_account_brief(entry, account_number)
             try:
                 ok, details = await self._do_sign_for_account(entry)
                 all_ok = all_ok and ok
-                detail_text = "\n".join(details[:12]) if details else "无详细信息"
-                summaries.append(f"【账号 {account_number}】\n{account_brief}\n{detail_text}")
+                summaries.append(self._format_sign_result(entry, account_number, details))
             except Exception as e:
                 all_ok = False
-                summaries.append(f"【账号 {account_number}】\n{account_brief}\n❌ 签到失败：{str(e)}")
+                summaries.append(self._format_sign_result(entry, account_number, [], error=str(e)))
 
         self._store_accounts(user_data, accounts)
         users[user_id] = user_data
