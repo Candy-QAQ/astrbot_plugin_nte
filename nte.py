@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import os.path
+import secrets
+import string
 import time
 import uuid
 from datetime import date
@@ -40,6 +42,11 @@ BID = 'com.pwrd.htassistant'
 CHANNELID = '1'
 # usercenter/login + refreshToken 对 appversion 校验严格，当前可用值是 1.1.0
 APPVERSION = '1.1.0'
+# Verified against the public Tajiduo client implementations:
+# https://github.com/tyql688/NTEUID/blob/main/NTEUID/utils/sdk/tajiduo.py
+# https://github.com/zzstar101/taygedo-auto-attendance/blob/main/src/taygedo/protocol.ts
+TAJIDUO_DS_SALT = 'pUds3dfMkl'
+REQUEST_TIMEOUT = (10, 30)  # connection timeout, read timeout (seconds)
 OKHTTP_UA = 'okhttp/4.12.0'
 WEBVIEW_UA = (
     'Mozilla/5.0 (Linux; Android 15; TB321FU Build/AQ3A.240912.001; wv) '
@@ -96,116 +103,24 @@ CLOUD_UNTREATED_COUNT_URL = 'https://user.laohu.com/cloud/game/query/duration/gi
 
 def config_logger():
     current_date = date.today().strftime('%Y-%m-%d')
-    if not os.path.exists('logs'):
-        os.mkdir('logs')
+    os.makedirs('logs', exist_ok=True)
     logger = logging.getLogger()
-
-    file_handler = logging.FileHandler(f'./logs/{current_date}.log', encoding='utf-8')
-    logger.addHandler(file_handler)
-    logging.getLogger().setLevel(logging.DEBUG)
+    log_path = os.path.abspath(os.path.join('logs', f'{current_date}.log'))
+    # Only manage handlers created here; leave AstrBot/other libraries alone.
+    for handler in list(logger.handlers):
+        if not getattr(handler, '_nte_log_handler', False):
+            continue
+        if handler.baseFilename == log_path:
+            return logger
+        logger.removeHandler(handler)
+        handler.close()
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler._nte_log_handler = True
     file_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
-    file_handler.setFormatter(formatter)
-
-    def scrub(value):
-        filter_key = {
-            'code',
-            'cred',
-            'authorization',
-            'captcha',
-            'cellphone',
-            'phone',
-            'password',
-        }
-        if isinstance(value, dict):
-            masked = {}
-            for k, v in value.items():
-                key = str(k).lower()
-                if key in filter_key or 'token' in key:
-                    masked[k] = '*****'
-                else:
-                    masked[k] = scrub(v)
-            return masked
-        if isinstance(value, list):
-            return [scrub(i) for i in value]
-        return value
-
-    def compact_data(data):
-        if isinstance(data, list):
-            return {'count': len(data)}
-        if not isinstance(data, dict):
-            return data
-
-        compact = {}
-        for key in ('uid', 'userId', 'bindRole', 'todaySign', 'day', 'days', 'month', 'reSignCnt', 'firstLogin'):
-            if key in data:
-                compact[key] = data[key]
-
-        roles = data.get('roles')
-        if isinstance(roles, list):
-            compact['rolesCount'] = len(roles)
-            if roles and isinstance(roles[0], dict):
-                role = {}
-                for key in ('gameId', 'roleId', 'roleName', 'lev', 'serverName'):
-                    if key in roles[0]:
-                        role[key] = roles[0][key]
-                if role:
-                    compact['firstRole'] = role
-
-        if not compact:
-            compact['keys'] = list(data.keys())[:5]
-        return compact
-
-    def compact_payload(text):
-        try:
-            payload = json.loads(text)
-        except (TypeError, json.JSONDecodeError):
-            plain = str(text).replace('\n', ' ').strip()
-            return plain[:180] + ('...' if len(plain) > 180 else '')
-
-        payload = scrub(payload)
-        if isinstance(payload, dict):
-            compact = {}
-            for key in ('code', 'ok', 'msg', 'message'):
-                if key in payload:
-                    compact[key] = payload[key]
-            if 'data' in payload:
-                compact['data'] = compact_data(payload.get('data'))
-            elif 'result' in payload:
-                compact['result'] = compact_data(payload.get('result'))
-            payload = compact or compact_data(payload)
-        elif isinstance(payload, list):
-            payload = {'count': len(payload)}
-
-        return json.dumps(scrub(payload), ensure_ascii=False, separators=(',', ':'))
-
-    def compact_url(url):
-        try:
-            parsed = parse.urlparse(str(url))
-            if parsed.netloc:
-                return f'{parsed.netloc}{parsed.path}'
-            if parsed.path:
-                return parsed.path
-        except Exception:
-            pass
-        return str(url)
-
-    _get = requests.get
-    _post = requests.post
-
-    def get(*args, **kwargs):
-        response = _get(*args, **kwargs)
-        logger.info(f'GET {compact_url(args[0])} {response.status_code} | {compact_payload(response.text)}')
-        return response
-
-    def post(*args, **kwargs):
-        response = _post(*args, **kwargs)
-        logger.info(f'POST {compact_url(args[0])} {response.status_code} | {compact_payload(response.text)}')
-        return response
-
-    # 替换 requests 中的方法
-    requests.get = get
-    requests.post = post
+    file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+    logger.addHandler(file_handler)
+    logger.setLevel(logging.INFO)
+    return logger
 
 
 def _dedup_list(items):
@@ -258,17 +173,9 @@ def _default_game_id():
 
 
 def _candidate_sign_game_ids(primary_game_id):
-    candidates = []
-    env_candidates = _parse_role_ids(sign_game_ids_env)
-    if env_candidates:
-        candidates.extend(env_candidates)
-    candidates.extend([
-        str(primary_game_id or '').strip(),
-        _default_game_id(),
-        '1289',
-        '1257',
-    ])
-    return _dedup_list(candidates)
+    primary = str(primary_game_id or '').strip() or _default_game_id()
+    # Do not try the same role against other games unless explicitly requested.
+    return _dedup_list([primary] + _parse_role_ids(sign_game_ids_env))
 
 
 def _parse_role_ids(role_text):
@@ -328,17 +235,72 @@ def _safe_json(response, endpoint):
     if not response.text.strip():
         raise Exception(f'{endpoint} 返回空响应，status={response.status_code}')
     try:
-        return response.json()
-    except json.JSONDecodeError as ex:
-        raise Exception(f'{endpoint} 返回非JSON: {response.text[:200]}') from ex
+        payload = response.json()
+    except ValueError:
+        # HTML/proxy errors can contain credentials. Do not echo the body, even
+        # through an exception chain that AstrBot might log.
+        raise Exception(f'{endpoint} 返回非JSON，status={response.status_code}') from None
+    if not isinstance(payload, dict):
+        raise Exception(f'{endpoint} 返回JSON结构异常，status={response.status_code}')
+    return payload
+
+
+def _response_message(resp):
+    for key in ('msg', 'message'):
+        message = resp.get(key)
+        if isinstance(message, str) and message.strip():
+            return message.replace('\n', ' ').replace('\r', ' ')[:180]
+    code = resp.get('code')
+    if isinstance(code, int):
+        return f'接口返回错误（code={code}）'
+    return '接口返回错误'
+
+
+def generate_ds(app_version=APPVERSION):
+    timestamp = str(int(time.time()))
+    nonce = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+    digest = hashlib.md5(f'{timestamp}{nonce}{app_version}{TAJIDUO_DS_SALT}'.encode('utf-8')).hexdigest()
+    return f'{timestamp},{nonce},{digest}'
+
+
+def _request(method, url, headers=None, **kwargs):
+    request_headers = requests.structures.CaseInsensitiveDict(headers or {})
+    host = parse.urlparse(url).hostname
+    if host == 'bbs-api.tajiduo.com':
+        request_headers.setdefault('appversion', APPVERSION)
+        request_headers.setdefault('platform', 'android')
+        request_headers['ds'] = generate_ds(request_headers['appversion'])
+        # Custom signature headers must not follow a redirect to another host.
+        kwargs['allow_redirects'] = False
+    kwargs['timeout'] = REQUEST_TIMEOUT
+    request_func = requests.get if method == 'GET' else requests.post
+    try:
+        response = request_func(url, headers=request_headers, **kwargs)
+    except requests.Timeout:
+        raise Exception('网络请求超时，请稍后重试') from None
+    except requests.RequestException:
+        # requests exceptions may include a URL with credentials in its query.
+        raise Exception('网络请求失败，请检查网络后重试') from None
+    # Log a fixed metadata whitelist, with no headers, query or response body.
+    logging.getLogger(__name__).info('%s %s%s status=%s', method, host,
+                                    parse.urlparse(url).path, response.status_code)
+    return response
+
+
+def _request_get(url, headers=None, **kwargs):
+    return _request('GET', url, headers=headers, **kwargs)
+
+
+def _request_post(url, headers=None, **kwargs):
+    return _request('POST', url, headers=headers, **kwargs)
 
 
 def _request_form(url, data, headers):
-    return requests.post(url, data=parse.urlencode(data), headers=headers)
+    return _request_post(url, data=parse.urlencode(data), headers=headers)
 
 
 def _request_json(url, data, headers):
-    return requests.post(url, json=data, headers=headers)
+    return _request_post(url, json=data, headers=headers)
 
 
 def parse_account_line(line):
@@ -559,7 +521,7 @@ def send_captcha(phone, device_id):
     data['sign'] = generate_signature(data)
     resp = _safe_json(_request_form(SEND_CAPTCHA_URL, data, REQUEST_HEADERS_BASE), '发送验证码')
     if not _is_ok(resp):
-        raise Exception(f'发送验证码失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'发送验证码失败：{_response_message(resp)}')
 
 
 def check_captcha(phone, code, device_id):
@@ -581,7 +543,7 @@ def check_captcha(phone, code, device_id):
     data['sign'] = generate_signature(data)
     resp = _safe_json(_request_form(CHECK_CAPTCHA_URL, data, REQUEST_HEADERS_BASE), '验证验证码')
     if not _is_ok(resp):
-        raise Exception(f'验证码错误：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'验证码错误：{_response_message(resp)}')
 
 
 def login(phone, code, device_id):
@@ -609,12 +571,12 @@ def login(phone, code, device_id):
     data['sign'] = generate_signature(data)
     resp = _safe_json(_request_form(LOGIN_URL, data, REQUEST_HEADERS_BASE), '登录')
     if not _is_ok(resp):
-        raise Exception(f'登录失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'登录失败：{_response_message(resp)}')
     result = resp.get('result') or {}
     token = result.get('token')
     user_id = result.get('userId')
     if not token or user_id is None:
-        raise Exception(f'登录返回缺少 token/userId：{resp}')
+        raise Exception(f'登录返回缺少 token/userId')
     return token, str(user_id)
 
 
@@ -634,10 +596,10 @@ def query_cloud_whether_set_password(phone, device_id):
         'channelId': CLOUD_CHANNEL_ID,
     }
     params['sign'] = _cloud_generate_signature(params)
-    response = requests.get(CLOUD_QUERY_PASSWORD_URL, headers=CLOUD_LOGIN_HEADERS, params=params)
+    response = _request_get(CLOUD_QUERY_PASSWORD_URL, headers=CLOUD_LOGIN_HEADERS, params=params)
     resp = _safe_json(response, '云异环查询是否设置密码')
     if not _is_ok(resp):
-        raise Exception(f'云异环查询是否设置密码失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'云异环查询是否设置密码失败：{_response_message(resp)}')
     return resp.get('result') or {}
 
 
@@ -661,7 +623,7 @@ def send_cloud_captcha(phone, device_id):
     data['sign'] = _cloud_generate_signature(data)
     resp = _safe_json(_request_form(SEND_CAPTCHA_URL, data, CLOUD_LOGIN_HEADERS), '云异环发送验证码')
     if not _is_ok(resp):
-        raise Exception(f'云异环发送验证码失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'云异环发送验证码失败：{_response_message(resp)}')
 
 
 def cloud_login(phone, code, device_id):
@@ -689,12 +651,12 @@ def cloud_login(phone, code, device_id):
     data['sign'] = _cloud_generate_signature(data)
     resp = _safe_json(_request_form(LOGIN_URL, data, CLOUD_LOGIN_HEADERS), '云异环登录')
     if not _is_ok(resp):
-        raise Exception(f'云异环登录失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'云异环登录失败：{_response_message(resp)}')
     result = resp.get('result') or {}
     token = result.get('token')
     user_id = result.get('userId')
     if not token or user_id is None:
-        raise Exception(f'云异环登录返回缺少 token/userId：{resp}')
+        raise Exception(f'云异环登录返回缺少 token/userId')
     return token, str(user_id)
 
 
@@ -725,16 +687,16 @@ def _login_with_password_raw(phone, password, device_id, encrypt):
 def login_with_password(phone, password, device_id):
     resp = _login_with_password_raw(phone, password, device_id, encrypt=False)
     if not _is_ok(resp):
-        msg = str(resp.get('message') or resp.get('msg') or resp)
+        msg = _response_message(resp)
         if 'BAD_REQUEST' in msg:
             resp = _login_with_password_raw(phone, password, device_id, encrypt=True)
         if not _is_ok(resp):
-            raise Exception(f'密码登录失败：{resp.get("message") or resp.get("msg") or resp}')
+            raise Exception(f'密码登录失败：{_response_message(resp)}')
     result = resp.get('result') or {}
     token = result.get('token')
     user_id = result.get('userId')
     if not token or user_id is None:
-        raise Exception(f'密码登录返回缺少 token/userId：{resp}')
+        raise Exception(f'密码登录返回缺少 token/userId')
     return token, str(user_id)
 
 
@@ -754,10 +716,10 @@ def user_center_login(token, user_id, device_id):
     }
     resp = _safe_json(_request_form(USER_CENTER_LOGIN_URL, payload, headers), '用户中心登录')
     if not _is_ok(resp):
-        raise Exception(f'用户中心登录失败：{resp.get("msg") or resp}')
+        raise Exception(f'用户中心登录失败：{_response_message(resp)}')
     data = resp.get('data') or {}
     if not data.get('accessToken') or not data.get('refreshToken'):
-        raise Exception(f'用户中心登录返回缺少accessToken/refreshToken：{resp}')
+        raise Exception(f'用户中心登录返回缺少accessToken/refreshToken')
     return data
 
 
@@ -770,18 +732,18 @@ def refresh_access_token(account):
         'uid': '10000000',
         'User-Agent': OKHTTP_UA,
     }
-    response = requests.post(REFRESH_TOKEN_URL, headers=headers)
+    response = _request_post(REFRESH_TOKEN_URL, headers=headers)
     if response.status_code == 402:
         raise Exception('refreshToken 已失效，请重新登录')
     resp = _safe_json(response, '刷新token')
     if not _is_ok(resp):
-        raise Exception(f'刷新token失败：{resp.get("msg") or resp}')
+        raise Exception(f'刷新token失败：{_response_message(resp)}')
 
     data = resp.get('data') or {}
     access_token = data.get('accessToken')
     refresh_token = data.get('refreshToken')
     if not access_token or not refresh_token:
-        raise Exception(f'刷新token返回缺少accessToken/refreshToken：{resp}')
+        raise Exception(f'刷新token返回缺少accessToken/refreshToken')
     account['refreshToken'] = refresh_token
     if data.get('uid'):
         account['uid'] = str(data['uid'])
@@ -797,10 +759,10 @@ def get_game_roles_info(access_token, uid, device_id, game_id):
         'appversion': APPVERSION,
         'User-Agent': OKHTTP_UA,
     }
-    response = requests.get(GET_GAME_ROLES_URL, headers=headers, params={'gameId': game_id})
+    response = _request_get(GET_GAME_ROLES_URL, headers=headers, params={'gameId': game_id})
     resp = _safe_json(response, '获取角色列表')
     if not _is_ok(resp):
-        raise Exception(f'获取角色列表失败：{resp.get("msg") or resp}')
+        raise Exception(f'获取角色列表失败：{_response_message(resp)}')
     data = resp.get('data') or {}
     roles = data.get('roles', []) if isinstance(data, dict) else []
     return _parse_roles(roles)
@@ -826,24 +788,24 @@ def app_signin(access_token, uid, device_id):
         exp = data.get('exp', 0)
         coin = data.get('goldCoin', 0)
         return True, f'社区签到成功，获得{exp}经验，{coin}金币'
-    msg = str(resp.get('msg') or resp.get('message') or resp)
+    msg = _response_message(resp)
     if _is_already_signed(msg):
         return True, '社区今日已签到'
     return False, msg
 
 
 def get_game_sign_state(access_token, game_id):
-    response = requests.get(
+    response = _request_get(
         GAME_SIGNIN_STATE_URL,
         headers={'Authorization': access_token},
         params={'gameId': game_id},
     )
     resp = _safe_json(response, f'查询游戏签到状态(gameId={game_id})')
     if not _is_ok(resp):
-        raise Exception(f'查询游戏签到状态失败(gameId={game_id})：{resp.get("msg") or resp}')
+        raise Exception(f'查询游戏签到状态失败(gameId={game_id})：{_response_message(resp)}')
     data = resp.get('data') or {}
     if not isinstance(data, dict):
-        raise Exception(f'查询游戏签到状态返回结构异常(gameId={game_id})：{resp}')
+        raise Exception(f'查询游戏签到状态返回结构异常(gameId={game_id})')
     return data
 
 
@@ -851,14 +813,14 @@ def get_game_sign_rewards(access_token, role_id, game_id):
     params = {'gameId': game_id}
     if role_id:
         params['roleId'] = role_id
-    response = requests.get(
+    response = _request_get(
         GAME_SIGN_REWARDS_URL,
         headers={'Authorization': access_token},
         params=params,
     )
     resp = _safe_json(response, f'查询游戏签到奖励(gameId={game_id})')
     if not _is_ok(resp):
-        raise Exception(f'查询游戏签到奖励失败(gameId={game_id})：{resp.get("msg") or resp}')
+        raise Exception(f'查询游戏签到奖励失败(gameId={game_id})：{_response_message(resp)}')
 
     data = resp.get('data')
     if isinstance(data, list):
@@ -868,7 +830,7 @@ def get_game_sign_rewards(access_token, role_id, game_id):
             items = data.get(key)
             if isinstance(items, list):
                 return items
-    raise Exception(f'查询游戏签到奖励返回结构异常(gameId={game_id})：{resp}')
+    raise Exception(f'查询游戏签到奖励返回结构异常(gameId={game_id})')
 
 
 def _format_reward_item_text(item):
@@ -933,7 +895,7 @@ def game_signin(access_token, role_id, game_id):
         if _is_ok(resp):
             return True, f'签到成功（gameId={sign_game_id}）{_reward_suffix(sign_game_id)}'
 
-        msg = str(resp.get('msg') or resp.get('message') or resp)
+        msg = _response_message(resp)
         if _is_already_signed(msg):
             state_data = _state_of(sign_game_id)
             if state_data and bool(state_data.get('todaySign')):
@@ -987,22 +949,22 @@ def cloud_get_user_info(account):
         '云异环查询时长',
     )
     if not _is_ok(resp):
-        raise Exception(f'云异环查询时长失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'云异环查询时长失败：{_response_message(resp)}')
     result = resp.get('result') or {}
     if not isinstance(result, dict):
-        raise Exception(f'云异环查询时长返回结构异常：{resp}')
+        raise Exception(f'云异环查询时长返回结构异常')
     return result
 
 
 def cloud_untreated_count(account):
-    response = requests.get(
+    response = _request_get(
         CLOUD_UNTREATED_COUNT_URL,
         headers=CLOUD_GAME_HEADERS,
         params=_cloud_game_params(account),
     )
     resp = _safe_json(response, '云异环查询待领取时长')
     if not _is_ok(resp):
-        raise Exception(f'云异环查询待领取时长失败：{resp.get("message") or resp.get("msg") or resp}')
+        raise Exception(f'云异环查询待领取时长失败：{_response_message(resp)}')
     result = resp.get('result') or {}
     if isinstance(result, dict):
         try:
@@ -1233,7 +1195,7 @@ def init_token():
     return selected_accounts
 
 
-def do_sign(account):
+def do_sign(account, output=print):
     account['gameId'] = str(account.get('gameId') or _default_game_id())
     if not account.get('deviceId'):
         account['deviceId'] = _random_device_id()
@@ -1253,7 +1215,7 @@ def do_sign(account):
         if uid:
             app_ok, app_msg = app_signin(access_token, uid, account['deviceId'])
             account_msg = f'账号{uid}：{app_msg}'
-            print(account_msg)
+            output(account_msg)
             if app_ok:
                 logging.info(account_msg)
             else:
@@ -1262,7 +1224,7 @@ def do_sign(account):
                 success = False
         else:
             skip_msg = '当前账号没有 uid，跳过社区签到。'
-            print(skip_msg)
+            output(skip_msg)
             logging.info(skip_msg)
 
         role_ids = _dedup_list(account.get('roleIds', []))
@@ -1283,7 +1245,7 @@ def do_sign(account):
             account['roles'] = roles
 
         if not role_ids:
-            print('未找到角色ID，请设置 TGD_ROLE_IDS 或重新登录以自动拉取角色。')
+            output('未找到角色ID，请设置 TGD_ROLE_IDS 或重新登录以自动拉取角色。')
             success = False
 
         for role_id in role_ids:
@@ -1291,11 +1253,11 @@ def do_sign(account):
             role_label = _role_label(role_id, roles)
             if ok:
                 role_msg = f'{role_label}签到成功：{message}'
-                print(role_msg)
+                output(role_msg)
                 logging.info(role_msg)
             else:
                 role_msg = f'{role_label}签到失败：{message}'
-                print(role_msg)
+                output(role_msg)
                 logging.warning(role_msg)
                 success = False
     else:
@@ -1303,7 +1265,7 @@ def do_sign(account):
 
     if has_cloud:
         cloud_ok, cloud_msg = cloud_claim_daily_duration(account)
-        print(cloud_msg)
+        output(cloud_msg)
         if cloud_ok:
             logging.info(cloud_msg)
         else:

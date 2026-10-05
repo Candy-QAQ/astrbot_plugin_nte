@@ -8,6 +8,7 @@ Commands:
 - nte (private): 立即签到
 - ntelist (private): 查看当前已绑定账号
 - ntelogout (private): 解除绑定
+- ntecancel (private): 取消当前登录流程
 - ntehelp: 查看帮助
 """
 
@@ -19,24 +20,26 @@ from astrbot.api.event import AstrMessageEvent, filter, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.config import put_config
 import asyncio
-import contextlib
 import copy
-import io
 import random
 import re
+import uuid
 
 from . import nte
 
 PLUGIN_NAME = "astrbot_plugin_nte"
 PENDING_EXPIRE_SECONDS = 600
+SMS_COOLDOWN_SECONDS = 60
+SMS_DAILY_LIMIT = 10
 PHONE_RE = re.compile(r"^1\d{10}$")
+SMS_CODE_RE = re.compile(r"^[0-9]{4,8}$")
 COMMAND_TEXT_RE = re.compile(
-    r"^/?(nte|ntepw|nteph|nteyun|ntelist|ntelogout|ntehelp)(\s|$)",
+    r"^/?(nte|ntepw|nteph|nteyun|ntelist|ntelogout|ntecancel|ntehelp)(\s|$)",
     re.IGNORECASE,
 )
 
 
-@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.0")
+@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.1")
 class NTEPlugin(Star):
     """异环签到插件"""
 
@@ -44,6 +47,10 @@ class NTEPlugin(Star):
         super().__init__(context)
         self.config = config
         self.scheduler = AsyncIOScheduler()
+        self._state_lock = asyncio.Lock()
+        self._login_requests: dict[str, str] = {}
+        self._signing_accounts: dict[tuple[str, str], str] = {}
+        self._user_key_aliases: dict[str, str] = {}
         self._init_config()
 
     def _init_config(self):
@@ -435,7 +442,7 @@ class NTEPlugin(Star):
                 if reward_match:
                     reward = f" — {self._format_reward_text(reward_match.group(1))}"
                 elif message:
-                    cleaned = re.sub(r"（gameId=[^)]+）", "", message).strip("， ")
+                    cleaned = re.sub(r"[（(]gameId=[^）)]*[）)]", "", message).strip("， ")
                     reward = f" — {cleaned}" if cleaned else ""
                 result["games"].append(f"游戏  {'✅' if ok else '❌'} {role_name}{reward}")
                 continue
@@ -506,11 +513,9 @@ class NTEPlugin(Star):
             raise Exception("账号数据缺失，请重新登录")
 
         def _run_sign():
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                sign_ok = nte.do_sign(account)
-            text = buf.getvalue()
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            output: list[str] = []
+            sign_ok = nte.do_sign(account, output=output.append)
+            lines = [line.strip() for text in output for line in text.splitlines() if line.strip()]
             return sign_ok, lines
 
         ok, details = await asyncio.to_thread(_run_sign)
@@ -523,7 +528,8 @@ class NTEPlugin(Star):
         if not config.get("auto_sign_enabled", False):
             return
 
-        users = await self.get_kv_data("users", {})
+        async with self._state_lock:
+            users = copy.deepcopy(await self.get_kv_data("users", {}))
         if not users:
             return
 
@@ -538,8 +544,10 @@ class NTEPlugin(Star):
             for index, entry in enumerate(accounts, start=1):
                 if max_delay > 0:
                     await asyncio.sleep(random.uniform(0, max_delay))
+                if not await self._account_still_bound([user_id], entry):
+                    continue
                 try:
-                    ok, details = await self._do_sign_for_account(entry)
+                    ok, details = await self._sign_bound_account([user_id], entry)
                     all_ok = all_ok and ok
                     summaries.append(self._format_sign_result(entry, index, details))
                 except Exception as e:
@@ -547,28 +555,196 @@ class NTEPlugin(Star):
                     logger.error(f"用户 {user_id} 的第 {index} 个账号自动签到失败: {e}")
                     summaries.append(self._format_sign_result(entry, index, [], error=str(e)))
 
-            self._store_accounts(user_data, accounts)
-            users[user_id] = user_data
+            _, current_user = await self._load_user([user_id])
+            if not current_user or not summaries:
+                continue
             header = "🎮 异环自动签到完成\n结果：成功" if all_ok else "⚠️ 异环自动签到完成\n结果：部分失败，请查看详情"
             msg = header
             if summaries:
                 msg = f"{msg}\n\n" + "\n\n".join(summaries[:12])
-            await self._send_private_message(user_id, user_data, msg)
-        await self.put_kv_data("users", users)
+            await self._send_private_message(user_id, current_user, msg)
 
-    async def _set_pending(self, user_id: str, data: dict):
-        pending = await self.get_kv_data("pending_login", {})
-        pending[user_id] = {
-            **data,
-            "created_at": int(datetime.now().timestamp()),
-        }
-        await self.put_kv_data("pending_login", pending)
+    async def _load_user(self, user_keys: list[str]) -> tuple[str | None, dict | None]:
+        async with self._state_lock:
+            users = await self.get_kv_data("users", {})
+            key = self._find_user_key(users, user_keys)
+            if key is None:
+                return None, None
+            target = self._user_key_aliases.get(user_keys[0], user_keys[0])
+            if key != target:
+                users[target] = users.pop(key)
+                self._user_key_aliases[key] = target
+                for (owner, identity), token in list(self._signing_accounts.items()):
+                    if owner == key:
+                        self._signing_accounts[(target, identity)] = token
+                key = target
+                await self.put_kv_data("users", users)
+            return key, copy.deepcopy(users[key])
 
-    async def _clear_pending(self, user_id: str):
+    def _find_user_key(self, users: dict, user_keys: list[str]) -> str | None:
+        # 自动签到只携带旧存储键；私聊兼容裸 sender_id 时不能跨平台追踪别名。
+        keys = []
+        for key in user_keys:
+            alias = self._user_key_aliases.get(key)
+            keys.append(alias if alias and (len(user_keys) == 1 or alias in user_keys) else key)
+        keys.extend(user_keys)
+        return self._pick_existing_key(users, keys)
+
+    @staticmethod
+    def _same_binding(current: dict, expected: dict) -> bool:
+        return all(current.get(key) == expected.get(key) for key in ("phone", "bound_at", "account"))
+
+    async def _account_still_bound(self, user_keys: list[str], entry: dict) -> bool:
+        _, user_data = await self._load_user(user_keys)
+        return bool(user_data and any(
+            self._same_binding(item, entry) for item in self._normalize_accounts(user_data)
+        ))
+
+    async def _commit_sign_result(self, user_keys: list[str], before: dict, after: dict) -> bool:
+        # 网络请求期间可能发生注销或重新登录，只更新仍然存在且凭据未变的绑定。
+        async with self._state_lock:
+            users = await self.get_kv_data("users", {})
+            key = self._find_user_key(users, user_keys)
+            if key is None:
+                return False
+            user_data = users[key]
+            accounts = self._normalize_accounts(user_data)
+            for index, current in enumerate(accounts):
+                if self._same_binding(current, before):
+                    accounts[index] = copy.deepcopy(after)
+                    self._store_accounts(user_data, accounts)
+                    users[key] = user_data
+                    await self.put_kv_data("users", users)
+                    return True
+            return False
+
+    async def _sign_bound_account(self, user_keys: list[str], entry: dict) -> tuple[bool, list[str]]:
+        async with self._state_lock:
+            users = await self.get_kv_data("users", {})
+            key = self._find_user_key(users, user_keys)
+            current = next((item for item in self._normalize_accounts(users[key])
+                            if self._same_binding(item, entry)), None) if key else None
+            if current is None:
+                return False, ["账号绑定已变更，已跳过本次签到"]
+            account = current.get("account") or {}
+            identity = str(current.get("phone") or account.get("uid") or account.get("cloudUserId") or current.get("bound_at"))
+            sign_key = (key, identity)
+            if sign_key in self._signing_accounts:
+                return False, ["该账号正在签到，请稍后查看结果"]
+            sign_token = uuid.uuid4().hex
+            self._signing_accounts[sign_key] = sign_token
+            before = copy.deepcopy(current)
+            entry.clear()
+            entry.update(current)
+        try:
+            result = await self._do_sign_for_account(entry)
+            await self._commit_sign_result(user_keys, before, entry)
+            return result
+        finally:
+            async with self._state_lock:
+                self._signing_accounts = {
+                    key: token for key, token in self._signing_accounts.items() if token != sign_token
+                }
+
+    async def _clear_pending_unlocked(self, user_keys: list[str]) -> bool:
         pending = await self.get_kv_data("pending_login", {})
-        if user_id in pending:
-            del pending[user_id]
+        changed = False
+        for key in user_keys:
+            if key in pending:
+                del pending[key]
+                changed = True
+            if self._login_requests.pop(key, None) is not None:
+                changed = True
+        if changed:
             await self.put_kv_data("pending_login", pending)
+        return changed
+
+    async def _clear_pending(self, user_ids: str | list[str]) -> bool:
+        keys = [user_ids] if isinstance(user_ids, str) else user_ids
+        async with self._state_lock:
+            return await self._clear_pending_unlocked(keys)
+
+    async def _prepare_login(self, user_keys: list[str], mode: str, phone: str) -> tuple[str | None, str | None]:
+        async with self._state_lock:
+            users = await self.get_kv_data("users", {})
+            max_users = int(self._get_config().get("max_users", 20))
+            if self._pick_existing_key(users, user_keys) is None and max_users > 0 and len(users) >= max_users:
+                return None, f"❌ 绑定失败：已达到最大用户数限制（{max_users}）"
+            if mode in ("sms", "cloud_sms"):
+                limits = await self.get_kv_data("captcha_limits", {})
+                now = int(datetime.now().timestamp())
+                today = datetime.now().date().isoformat()
+                limit_keys = [f"user:{user_keys[0]}", f"phone:{phone}"]
+                for key in limit_keys:
+                    limit = limits.get(key, {})
+                    remaining = SMS_COOLDOWN_SECONDS - (now - int(limit.get("last_sent", 0)))
+                    if remaining > 0:
+                        return None, f"验证码请求过于频繁，请 {remaining} 秒后重试；已收到的验证码仍可使用"
+                    if limit.get("day") == today and int(limit.get("count", 0)) >= SMS_DAILY_LIMIT:
+                        return None, f"今日验证码请求已达上限（{SMS_DAILY_LIMIT}次），请明天再试"
+                # 预留次数包含失败请求，避免并发发码和反复失败绕过限流。
+                limits = {key: value for key, value in limits.items()
+                          if value.get("day") == today or now - int(value.get("last_sent", 0)) < SMS_COOLDOWN_SECONDS}
+                for key in limit_keys:
+                    previous = limits.get(key, {})
+                    count = int(previous.get("count", 0)) if previous.get("day") == today else 0
+                    limits[key] = {"day": today, "last_sent": now, "count": count + 1}
+                await self.put_kv_data("captcha_limits", limits)
+            await self._clear_pending_unlocked(user_keys)
+            request_id = uuid.uuid4().hex
+            self._login_requests[user_keys[0]] = request_id
+            return request_id, None
+
+    async def _set_pending(self, user_id: str, data: dict, request_id: str | None = None) -> bool:
+        async with self._state_lock:
+            if request_id is not None and self._login_requests.get(user_id) != request_id:
+                return False
+            request_id = request_id or uuid.uuid4().hex
+            pending = await self.get_kv_data("pending_login", {})
+            pending[user_id] = {**data, "created_at": int(datetime.now().timestamp()), "request_id": request_id}
+            self._login_requests[user_id] = request_id
+            await self.put_kv_data("pending_login", pending)
+            return True
+
+    async def _end_login_request(self, user_id: str, request_id: str) -> bool:
+        async with self._state_lock:
+            if self._login_requests.get(user_id) != request_id:
+                return False
+            del self._login_requests[user_id]
+            return True
+
+    async def _take_pending_input(self, user_keys: list[str], content: str) -> tuple[dict | None, str | None]:
+        async with self._state_lock:
+            pending = await self.get_kv_data("pending_login", {})
+            key = self._pick_existing_key(pending, user_keys)
+            session = pending.get(key) if key else None
+            if not session:
+                return None, None
+            if not isinstance(session, dict):
+                await self._clear_pending_unlocked(user_keys)
+                return None, "登录状态异常，请重新发送 /ntepw、/nteph 或 /nteyun"
+            mode = session.get("mode")
+            is_code = bool(SMS_CODE_RE.fullmatch(content))
+            try:
+                created_at = int(session.get("created_at", 0))
+            except (TypeError, ValueError):
+                created_at = 0
+            if created_at <= 0 or int(datetime.now().timestamp()) - created_at > PENDING_EXPIRE_SECONDS:
+                await self._clear_pending_unlocked(user_keys)
+                if mode in ("sms", "cloud_sms") and not is_code:
+                    return None, None
+                return None, "登录流程已过期，请重新发送 /ntepw、/nteph 或 /nteyun"
+            if mode not in ("password", "sms", "cloud_sms"):
+                await self._clear_pending_unlocked(user_keys)
+                return None, "登录状态异常，请重新发送 /ntepw、/nteph 或 /nteyun"
+            if mode in ("sms", "cloud_sms") and not is_code:
+                return None, None
+            # 消费本次输入后释放锁再访问网络，其他私聊不会重复提交凭据。
+            session = copy.deepcopy(session)
+            session["request_id"] = session.get("request_id") or uuid.uuid4().hex
+            await self._clear_pending_unlocked(user_keys)
+            self._login_requests[user_keys[0]] = session["request_id"]
+            return session, None
 
     @filter.command("ntehelp")
     async def ntehelp(self, event: AstrMessageEvent):
@@ -581,7 +757,10 @@ class NTEPlugin(Star):
             "5. /nte <序号> 只签到指定账号\n"
             "6. /ntelist 查看当前绑定账号\n"
             "7. /ntelogout 解除全部绑定\n"
-            "8. /ntelogout <序号> 删除指定账号绑定"
+            "8. /ntelogout <序号> 删除指定账号绑定\n"
+            "9. /ntecancel 取消当前登录，保留已绑定账号\n\n"
+            "验证码仅接收4至8位数字；登录失败后需重新发起登录。\n"
+            "验证码请求间隔至少60秒，每位用户及每个手机号每天最多10次。"
         )
 
     @filter.command("ntelist")
@@ -595,17 +774,10 @@ class NTEPlugin(Star):
             yield event.plain_result("无法识别当前用户，请稍后重试")
             return
         user_id = user_keys[0]
-        users = await self.get_kv_data("users", {})
-        existing_user_key = self._pick_existing_key(users, user_keys)
-        user_data = users.get(existing_user_key) if existing_user_key else None
+        _, user_data = await self._load_user(user_keys)
         if not user_data:
             yield event.plain_result("你还未绑定账号，请先使用 /ntepw、/nteph 或 /nteyun 登录")
             return
-
-        if existing_user_key and existing_user_key != user_id:
-            users[user_id] = users.pop(existing_user_key)
-            user_data = users[user_id]
-            await self.put_kv_data("users", users)
 
         accounts = self._normalize_accounts(user_data)
         if not accounts:
@@ -630,16 +802,13 @@ class NTEPlugin(Star):
             yield event.plain_result("无法识别当前用户，请稍后重试")
             return
         user_id = user_keys[0]
-        users = await self.get_kv_data("users", {})
-        config = self._get_config()
-        max_users = int(config.get("max_users", 20))
-        existing_key = self._pick_existing_key(users, user_keys)
-        if existing_key is None and max_users > 0 and len(users) >= max_users:
-            yield event.plain_result(f"❌ 绑定失败：已达到最大用户数限制（{max_users}）")
+        request_id, error = await self._prepare_login(user_keys, "password", phone)
+        if error:
+            yield event.plain_result(error)
             return
 
-        await self._set_pending(user_id, {"mode": "password", "phone": phone})
-        yield event.plain_result("已记录手机号，请直接回复密码（10分钟内有效）")
+        if await self._set_pending(user_id, {"mode": "password", "phone": phone}, request_id):
+            yield event.plain_result("已记录手机号，请直接回复密码（10分钟内有效）；发送 /ntecancel 可取消登录")
 
     @filter.command("nteph")
     async def nteph(self, event: AstrMessageEvent, phone: str = ""):
@@ -656,29 +825,29 @@ class NTEPlugin(Star):
             yield event.plain_result("无法识别当前用户，请稍后重试")
             return
         user_id = user_keys[0]
-        users = await self.get_kv_data("users", {})
-        config = self._get_config()
-        max_users = int(config.get("max_users", 20))
-        existing_key = self._pick_existing_key(users, user_keys)
-        if existing_key is None and max_users > 0 and len(users) >= max_users:
-            yield event.plain_result(f"❌ 绑定失败：已达到最大用户数限制（{max_users}）")
+        request_id, error = await self._prepare_login(user_keys, "sms", phone)
+        if error:
+            yield event.plain_result(error)
             return
 
         try:
             device_id = await asyncio.to_thread(nte.send_login_captcha, phone)
         except Exception as e:
-            yield event.plain_result(f"发送验证码失败：{str(e)}")
+            if await self._end_login_request(user_id, request_id):
+                yield event.plain_result(f"发送验证码失败：{str(e)}\n请稍后重新发送 /nteph <手机号>")
             return
 
-        await self._set_pending(
+        saved = await self._set_pending(
             user_id,
             {
                 "mode": "sms",
                 "phone": phone,
                 "device_id": device_id,
             },
+            request_id,
         )
-        yield event.plain_result("验证码已发送，请直接回复验证码（10分钟内有效）")
+        if saved:
+            yield event.plain_result("验证码已发送，请直接回复4至8位数字验证码（10分钟内有效）；发送 /ntecancel 可取消登录")
 
     @filter.command("nteyun")
     async def nteyun(self, event: AstrMessageEvent, phone: str = ""):
@@ -695,60 +864,53 @@ class NTEPlugin(Star):
             yield event.plain_result("无法识别当前用户，请稍后重试")
             return
         user_id = user_keys[0]
-        users = await self.get_kv_data("users", {})
-        config = self._get_config()
-        max_users = int(config.get("max_users", 20))
-        existing_key = self._pick_existing_key(users, user_keys)
-        if existing_key is None and max_users > 0 and len(users) >= max_users:
-            yield event.plain_result(f"❌ 绑定失败：已达到最大用户数限制（{max_users}）")
+        request_id, error = await self._prepare_login(user_keys, "cloud_sms", phone)
+        if error:
+            yield event.plain_result(error)
             return
 
         try:
             device_id = await asyncio.to_thread(nte.send_cloud_login_captcha, phone)
         except Exception as e:
-            yield event.plain_result(f"发送云异环验证码失败：{str(e)}")
+            if await self._end_login_request(user_id, request_id):
+                yield event.plain_result(f"发送云异环验证码失败：{str(e)}\n请稍后重新发送 /nteyun <手机号>")
             return
 
-        await self._set_pending(
+        saved = await self._set_pending(
             user_id,
             {
                 "mode": "cloud_sms",
                 "phone": phone,
                 "device_id": device_id,
             },
+            request_id,
         )
-        yield event.plain_result("云异环验证码已发送，请直接回复验证码（10分钟内有效）")
+        if saved:
+            yield event.plain_result("云异环验证码已发送，请直接回复4至8位数字验证码（10分钟内有效）；发送 /ntecancel 可取消登录")
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @filter.regex(r"^[^/].+")
+    @filter.regex(r"^[^/]")
     async def handle_pending_login_input(self, event: AstrMessageEvent):
+        if not self._is_private(event):
+            return
+        content = event.get_message_str().strip()
+        if not content or content.startswith("/") or COMMAND_TEXT_RE.match(content):
+            return
         user_keys = self._build_user_keys(event)
         if not user_keys:
             return
         user_id = user_keys[0]
-        pending = await self.get_kv_data("pending_login", {})
-        pending_key = self._pick_existing_key(pending, user_keys)
-        session = pending.get(pending_key) if pending_key else None
-        if not session:
+        session, error = await self._take_pending_input(user_keys, content)
+        if error:
+            yield event.plain_result(error)
             return
-
-        now_ts = int(datetime.now().timestamp())
-        created_at = int(session.get("created_at", 0))
-        if created_at <= 0 or now_ts - created_at > PENDING_EXPIRE_SECONDS:
-            await self._clear_pending(pending_key or user_id)
-            yield event.plain_result("登录流程已过期，请重新发送 /ntepw、/nteph 或 /nteyun")
-            return
-
-        content = event.get_message_str().strip()
-        if not content:
-            return
-        # 防止命令文本（包含可能被去掉 "/" 的情况）被误当作密码或验证码
-        if COMMAND_TEXT_RE.match(content):
+        if session is None:
             return
 
         mode = session.get("mode")
         phone = str(session.get("phone", "")).strip()
         device_id = str(session.get("device_id", "")).strip()
+        request_id = session["request_id"]
 
         try:
             if mode == "password":
@@ -757,46 +919,64 @@ class NTEPlugin(Star):
                 account = await asyncio.to_thread(nte.build_account_by_sms, phone, content, device_id)
             elif mode == "cloud_sms":
                 account = await asyncio.to_thread(nte.build_cloud_account_by_sms, phone, content, device_id)
-            else:
-                await self._clear_pending(pending_key or user_id)
-                yield event.plain_result("登录状态异常，请重新发送 /ntepw、/nteph 或 /nteyun")
-                return
         except Exception as e:
-            retry_hint = "可直接重试发送密码" if mode == "password" else "可直接重试发送验证码"
-            yield event.plain_result(f"登录失败：{str(e)}\n{retry_hint}")
+            command = {"password": "ntepw", "sms": "nteph", "cloud_sms": "nteyun"}[mode]
+            if await self._end_login_request(user_id, request_id):
+                yield event.plain_result(f"登录失败：{str(e)}\n本次登录已结束，请重新发送 /{command} <手机号>")
             return
 
-        users = await self.get_kv_data("users", {})
-        existing_user_key = self._pick_existing_key(users, user_keys)
-        if existing_user_key and existing_user_key != user_id:
-            users[user_id] = users.pop(existing_user_key)
-        user_data = users.get(user_id, {})
-        accounts = self._normalize_accounts(user_data)
-        new_entry = {
-            "account": account,
-            "phone": phone,
-            "kind": self._account_kind(account),
-            "bound_at": datetime.now().isoformat(),
-            "last_sign_at": None,
-        }
-        action, idx = self._upsert_account(accounts, new_entry)
-        user_data.update(
-            {
-                "last_username": event.get_sender_name(),
-                "platform_name": event.get_platform_name(),
-                "umo": event.unified_msg_origin,
-            }
-        )
-        self._store_accounts(user_data, accounts)
-        users[user_id] = user_data
-        await self.put_kv_data("users", users)
-        await self._clear_pending(pending_key or user_id)
+        error = None
+        async with self._state_lock:
+            if self._login_requests.get(user_id) != request_id:
+                return
+            del self._login_requests[user_id]
+            users = await self.get_kv_data("users", {})
+            existing_user_key = self._pick_existing_key(users, user_keys)
+            max_users = int(self._get_config().get("max_users", 20))
+            if existing_user_key is None and max_users > 0 and len(users) >= max_users:
+                error = f"❌ 绑定失败：已达到最大用户数限制（{max_users}），请稍后重新登录"
+            else:
+                if existing_user_key and existing_user_key != user_id:
+                    users[user_id] = users.pop(existing_user_key)
+                user_data = users.get(user_id, {})
+                accounts = self._normalize_accounts(user_data)
+                new_entry = {
+                    "account": account,
+                    "phone": phone,
+                    "kind": self._account_kind(account),
+                    "bound_at": datetime.now().isoformat(),
+                    "last_sign_at": None,
+                }
+                action, idx = self._upsert_account(accounts, new_entry)
+                user_data.update({
+                    "last_username": event.get_sender_name(),
+                    "platform_name": event.get_platform_name(),
+                    "umo": event.unified_msg_origin,
+                })
+                self._store_accounts(user_data, accounts)
+                users[user_id] = user_data
+                await self.put_kv_data("users", users)
+        if error:
+            yield event.plain_result(error)
+            return
         summaries = "\n".join(self._format_account_brief(item, i) for i, item in enumerate(accounts, start=1))
         action_text = "已更新已有账号" if action == "updated" else "已新增绑定账号"
         yield event.plain_result(
             f"登录成功，{action_text}。\n当前共绑定 {len(accounts)} 个账号。\n"
             f"本次账号序号：{idx + 1}\n\n{summaries}\n\n发送 /nte 即可签到全部账号。"
         )
+
+    @filter.command("ntecancel")
+    async def ntecancel(self, event: AstrMessageEvent):
+        if not self._is_private(event):
+            yield event.plain_result("请在私聊中使用 /ntecancel")
+            return
+        user_keys = self._build_user_keys(event)
+        if not user_keys:
+            yield event.plain_result("无法识别当前用户，请稍后重试")
+            return
+        changed = await self._clear_pending(user_keys)
+        yield event.plain_result("已取消当前登录，已绑定账号仍然保留" if changed else "当前没有进行中的登录")
 
     @filter.command("ntelogout")
     async def ntelogout(self, event: AstrMessageEvent, index: str = ""):
@@ -807,57 +987,40 @@ class NTEPlugin(Star):
         if not user_keys:
             yield event.plain_result("无法识别当前用户，请稍后重试")
             return
-        users = await self.get_kv_data("users", {})
-        user_id = user_keys[0]
-        existing_user_key = self._pick_existing_key(users, user_keys)
-        if existing_user_key and existing_user_key != user_id:
-            users[user_id] = users.pop(existing_user_key)
-            existing_user_key = user_id
-        changed = False
+        raw_index = index.strip()
+        if raw_index and not raw_index.isdigit():
+            yield event.plain_result("序号格式错误，请使用 /ntelogout 1")
+            return
+        error = None
         message = "你当前没有绑定账号"
-
-        if existing_user_key and existing_user_key in users:
-            user_data = users[existing_user_key]
-            accounts = self._normalize_accounts(user_data)
-            raw_index = index.strip()
-            if raw_index:
-                if not raw_index.isdigit():
-                    yield event.plain_result("序号格式错误，请使用 /ntelogout 1")
-                    return
-                target = int(raw_index)
-                if target <= 0 or target > len(accounts):
-                    yield event.plain_result(f"序号超出范围，当前共有 {len(accounts)} 个账号")
-                    return
-                removed = accounts.pop(target - 1)
-                changed = True
-                if accounts:
-                    self._store_accounts(user_data, accounts)
-                    users[existing_user_key] = user_data
-                    message = (
-                        f"已删除第 {target} 个账号绑定：{self._format_account_brief(removed, target)}\n"
-                        f"剩余 {len(accounts)} 个账号。"
-                    )
-                else:
-                    del users[existing_user_key]
-                    message = "已删除最后一个账号绑定，并清空当前用户的登录信息"
+        async with self._state_lock:
+            users = await self.get_kv_data("users", {})
+            key = self._pick_existing_key(users, user_keys)
+            accounts = self._normalize_accounts(users[key]) if key else []
+            target = int(raw_index) if raw_index else None
+            if target is not None and (target <= 0 or target > len(accounts)):
+                error = f"序号超出范围，当前共有 {len(accounts)} 个账号"
             else:
-                del users[existing_user_key]
-                changed = True
-                message = "已清除全部登录信息"
-
-        if changed:
-            await self.put_kv_data("users", users)
-
-        pending = await self.get_kv_data("pending_login", {})
-        pending_changed = False
-        for user_id in user_keys:
-            if user_id in pending:
-                del pending[user_id]
-                pending_changed = True
-        if pending_changed:
-            await self.put_kv_data("pending_login", pending)
-            changed = True
-        yield event.plain_result(message if changed else "你当前没有绑定账号")
+                if key:
+                    if target is None:
+                        del users[key]
+                        message = "已清除全部登录信息"
+                    else:
+                        removed = accounts.pop(target - 1)
+                        if accounts:
+                            self._store_accounts(users[key], accounts)
+                            message = (
+                                f"已删除第 {target} 个账号绑定：{self._format_account_brief(removed, target)}\n"
+                                f"剩余 {len(accounts)} 个账号。"
+                            )
+                        else:
+                            del users[key]
+                            message = "已删除最后一个账号绑定，并清空当前用户的登录信息"
+                    await self.put_kv_data("users", users)
+                cancelled = await self._clear_pending_unlocked(user_keys)
+                if not key and cancelled:
+                    message = "已取消当前登录，你当前没有绑定账号"
+        yield event.plain_result(error or message)
 
     @filter.command("nte")
     async def nte_sign(self, event: AstrMessageEvent, index: str = ""):
@@ -869,17 +1032,10 @@ class NTEPlugin(Star):
         if not user_keys:
             yield event.plain_result("无法识别当前用户，请稍后重试")
             return
-        user_id = user_keys[0]
-        users = await self.get_kv_data("users", {})
-        existing_user_key = self._pick_existing_key(users, user_keys)
-        user_data = users.get(existing_user_key) if existing_user_key else None
+        _, user_data = await self._load_user(user_keys)
         if not user_data:
             yield event.plain_result("你还未绑定账号，请先使用 /ntepw、/nteph 或 /nteyun 登录")
             return
-
-        if existing_user_key and existing_user_key != user_id:
-            users[user_id] = users.pop(existing_user_key)
-            user_data = users[user_id]
 
         accounts = self._normalize_accounts(user_data)
         if not accounts:
@@ -912,16 +1068,13 @@ class NTEPlugin(Star):
             entry = accounts[target_index]
             account_number = target_index + 1
             try:
-                ok, details = await self._do_sign_for_account(entry)
+                ok, details = await self._sign_bound_account(user_keys, entry)
                 all_ok = all_ok and ok
                 summaries.append(self._format_sign_result(entry, account_number, details))
             except Exception as e:
                 all_ok = False
                 summaries.append(self._format_sign_result(entry, account_number, [], error=str(e)))
 
-        self._store_accounts(user_data, accounts)
-        users[user_id] = user_data
-        await self.put_kv_data("users", users)
         detail_text = "\n\n".join(summaries[:12]) if summaries else "无详细信息"
         if all_ok:
             yield event.plain_result(f"✅ 签到完成\n\n{detail_text}")
