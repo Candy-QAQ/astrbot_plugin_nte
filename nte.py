@@ -1,17 +1,16 @@
 import base64
 import hashlib
 import json
-import logging
 import os
 import os.path
 import secrets
 import string
 import time
 import uuid
-from datetime import date
 from urllib import parse
 
 import requests
+from astrbot.api import logger
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -99,28 +98,6 @@ GAME_SIGNIN_STATE_URL = 'https://bbs-api.tajiduo.com/apihub/awapi/signin/state'
 GAME_SIGN_REWARDS_URL = 'https://bbs-api.tajiduo.com/apihub/awapi/sign/rewards'
 CLOUD_USER_INFO_URL = 'https://user.laohu.com/cloud/game/getUserInfo'
 CLOUD_UNTREATED_COUNT_URL = 'https://user.laohu.com/cloud/game/query/duration/give/untreatedCount'
-
-
-def config_logger():
-    current_date = date.today().strftime('%Y-%m-%d')
-    os.makedirs('logs', exist_ok=True)
-    logger = logging.getLogger()
-    log_path = os.path.abspath(os.path.join('logs', f'{current_date}.log'))
-    # Only manage handlers created here; leave AstrBot/other libraries alone.
-    for handler in list(logger.handlers):
-        if not getattr(handler, '_nte_log_handler', False):
-            continue
-        if handler.baseFilename == log_path:
-            return logger
-        logger.removeHandler(handler)
-        handler.close()
-    file_handler = logging.FileHandler(log_path, encoding='utf-8')
-    file_handler._nte_log_handler = True
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
-    logger.addHandler(file_handler)
-    logger.setLevel(logging.INFO)
-    return logger
 
 
 def _dedup_list(items):
@@ -282,8 +259,7 @@ def _request(method, url, headers=None, **kwargs):
         # requests exceptions may include a URL with credentials in its query.
         raise Exception('网络请求失败，请检查网络后重试') from None
     # Log a fixed metadata whitelist, with no headers, query or response body.
-    logging.getLogger(__name__).info('%s %s%s status=%s', method, host,
-                                    parse.urlparse(url).path, response.status_code)
+    logger.info(f'{method} {host}{parse.urlparse(url).path} status={response.status_code}')
     return response
 
 
@@ -870,7 +846,7 @@ def game_signin(access_token, role_id, game_id):
         try:
             return get_game_sign_state(access_token, gid)
         except Exception as ex:
-            logging.warning(f'查询游戏签到状态失败(gameId={gid})：{ex}')
+            logger.warning(f'查询游戏签到状态失败(gameId={gid})：{ex}')
             return None
 
     def _reward_suffix(gid, state_data=None):
@@ -878,7 +854,7 @@ def game_signin(access_token, role_id, game_id):
             reward_text = _today_reward_text(access_token, role_id, gid, state_data=state_data)
             return f'，今日道具：{reward_text}' if reward_text else ''
         except Exception as ex:
-            logging.warning(f'读取游戏签到道具失败(gameId={gid}, roleId={role_id})：{ex}')
+            logger.warning(f'读取游戏签到道具失败(gameId={gid}, roleId={role_id})：{ex}')
             return ''
 
     headers = {
@@ -995,7 +971,7 @@ def cloud_claim_daily_duration(account):
     try:
         untreated_count = cloud_untreated_count(account)
     except Exception as ex:
-        logging.warning(f'云异环查询待领取时长失败：{ex}')
+        logger.warning(f'云异环查询待领取时长失败：{ex}')
 
     parts = [
         f'云异环时长：剩余{_format_cloud_duration(info.get("remainedDuration"))}',
@@ -1217,15 +1193,15 @@ def do_sign(account, output=print):
             account_msg = f'账号{uid}：{app_msg}'
             output(account_msg)
             if app_ok:
-                logging.info(account_msg)
+                logger.info(account_msg)
             else:
-                logging.warning(account_msg)
+                logger.warning(account_msg)
             if not app_ok:
                 success = False
         else:
             skip_msg = '当前账号没有 uid，跳过社区签到。'
             output(skip_msg)
-            logging.info(skip_msg)
+            logger.info(skip_msg)
 
         role_ids = _dedup_list(account.get('roleIds', []))
         env_role_ids = _parse_role_ids(role_ids_env)
@@ -1239,7 +1215,7 @@ def do_sign(account, output=print):
                     roles = latest_roles
                     role_ids = _dedup_list(role_ids + [role['roleId'] for role in latest_roles])
             except Exception as ex:
-                logging.warning(f'刷新角色列表失败：{ex}')
+                logger.warning(f'刷新角色列表失败：{ex}')
         account['roleIds'] = role_ids
         if roles:
             account['roles'] = roles
@@ -1254,22 +1230,22 @@ def do_sign(account, output=print):
             if ok:
                 role_msg = f'{role_label}签到成功：{message}'
                 output(role_msg)
-                logging.info(role_msg)
+                logger.info(role_msg)
             else:
                 role_msg = f'{role_label}签到失败：{message}'
                 output(role_msg)
-                logging.warning(role_msg)
+                logger.warning(role_msg)
                 success = False
     else:
-        logging.info('当前账号没有 refreshToken，跳过塔吉多社区/游戏签到。')
+        logger.info('当前账号没有 refreshToken，跳过塔吉多社区/游戏签到。')
 
     if has_cloud:
         cloud_ok, cloud_msg = cloud_claim_daily_duration(account)
         output(cloud_msg)
         if cloud_ok:
-            logging.info(cloud_msg)
+            logger.info(cloud_msg)
         else:
-            logging.warning(cloud_msg)
+            logger.warning(cloud_msg)
             success = False
     return success
 
@@ -1279,7 +1255,7 @@ def start():
         accounts = init_token()
     except Exception as ex:
         print(f'初始化失败，原因：{str(ex)}')
-        logging.error('', exc_info=ex)
+        logger.exception('初始化失败')
         return False
 
     success = True
@@ -1288,7 +1264,7 @@ def start():
             success = do_sign(account) and success
         except Exception as ex:
             print(f'签到失败，原因：{str(ex)}')
-            logging.error('', exc_info=ex)
+            logger.exception('签到失败')
             success = False
 
     if accounts and not token_env:
@@ -1299,14 +1275,13 @@ def start():
 
 if __name__ == '__main__':
     print('塔吉多（异环）自动签到脚本')
-    config_logger()
 
-    logging.info('任务开始')
+    logger.info('任务开始')
 
     start_time = time.time()
     success = start()
     end_time = time.time()
-    logging.info(f'任务结束 | success={success} | 耗时={(end_time - start_time) * 1000:.0f}ms')
+    logger.info(f'任务结束 | success={success} | 耗时={(end_time - start_time) * 1000:.0f}ms')
     if (exit_when_fail_env == "on") and not success:
         exit(1)
     if (os.name == 'nt') and (not token_env) and (not no_pause_env) and (not success):

@@ -3,11 +3,10 @@
 import asyncio
 import copy
 import importlib.util
-import logging
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +64,34 @@ def _unmocked_api(*args, **kwargs):
     raise AssertionError("The test must mock account APIs; network access is forbidden")
 
 
+def load_nte_module(logger=None):
+    """Load real HTTP helpers with an isolated AstrBot logger dependency."""
+    # Keep real dependencies outside the temporary sys.modules snapshot.
+    # cryptography resolves algorithm classes lazily and requires their identity
+    # to stay consistent after the framework stubs have been removed.
+    for dependency in (
+        "requests",
+        "cryptography.hazmat.primitives.padding",
+        "cryptography.hazmat.primitives.ciphers",
+    ):
+        importlib.import_module(dependency)
+    if logger is None:
+        logger = Mock(spec=("info", "warning", "error", "exception", "debug"))
+    astrbot = ModuleType("astrbot")
+    api = ModuleType("astrbot.api")
+    api.logger = logger
+    astrbot.api = api
+    spec = importlib.util.spec_from_file_location("_nte_http_tests", ROOT / "nte.py")
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {
+        "astrbot": astrbot,
+        "astrbot.api": api,
+        spec.name: module,
+    }):
+        spec.loader.exec_module(module)
+    return module
+
+
 def load_plugin_module():
     """Load the real main.py with framework dependencies isolated to this import."""
     package_name = "_nte_pending_login_tests"
@@ -85,7 +112,7 @@ def load_plugin_module():
 
     astrbot = ModuleType("astrbot")
     api = ModuleType("astrbot.api")
-    api.logger = logging.getLogger("nte.tests")
+    api.logger = Mock(spec=("info", "warning", "error", "exception", "debug"))
     api.AstrBotConfig = dict
     event = ModuleType("astrbot.api.event")
     event.AstrMessageEvent = MessageEvent

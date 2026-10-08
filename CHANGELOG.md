@@ -1,5 +1,14 @@
 # 更新记录
 
+## v1.1.2（2026-10-08）
+
+- 修复 v1.1.1 上架审核指出的日志来源问题：`nte.py` 统一通过 `from astrbot.api import logger` 使用 AstrBot 日志。
+- 删除内置日志模块、自建日志文件及 root logger 配置，日志级别、输出位置和轮转交由 AstrBot 管理。
+- HTTP 日志继续只记录请求方法、域名、路径和状态码；异常通过 AstrBot logger 记录，保留现有响应体和凭据保护。
+- 调整离线测试的 AstrBot logger 模拟，并新增日志来源、日志内容及导入时不创建日志文件的回归检查。
+
+本次修改针对日志规范问题。离线验证不代表插件市场自动安全审核已经通过，仍需提交新版本重新审核。
+
 ## v1.1.1（2026-10-05）
 
 修复 [issue #1](https://github.com/Candy-QAQ/astrbot_plugin_nte/issues/1) 及其中已确认的相关缺陷：

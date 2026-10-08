@@ -39,7 +39,7 @@ COMMAND_TEXT_RE = re.compile(
 )
 
 
-@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.1")
+@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.2")
 class NTEPlugin(Star):
     """异环签到插件"""
 

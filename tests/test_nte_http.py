@@ -1,14 +1,19 @@
+import ast
 import json
-import logging
 import os
 import tempfile
 import traceback
 import unittest
-from datetime import date
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import nte
+try:
+    from .support import ROOT, load_nte_module
+except ImportError:
+    from support import ROOT, load_nte_module
+
+
+nte = load_nte_module()
 
 
 def make_response(payload=None, *, text=None, status=200):
@@ -177,50 +182,74 @@ class NteLoggerTests(unittest.TestCase):
     def setUp(self):
         self.previous_cwd = os.getcwd()
         self.directory = tempfile.TemporaryDirectory()
-        self.root_logger = logging.getLogger()
-        self.previous_level = self.root_logger.level
-        self.previous_handlers = list(self.root_logger.handlers)
         os.chdir(self.directory.name)
 
     def tearDown(self):
-        for handler in list(self.root_logger.handlers):
-            if handler not in self.previous_handlers:
-                self.root_logger.removeHandler(handler)
-                handler.close()
-        self.root_logger.setLevel(self.previous_level)
         os.chdir(self.previous_cwd)
         self.directory.cleanup()
 
-    def test_existing_log_and_repeated_configuration_are_safe_and_private(self):
-        Path('logs').mkdir()
-        log_path = Path('logs') / f'{date.today().isoformat()}.log'
-        log_path.write_text('existing log\n', encoding='utf-8')
-        before_get, before_post = nte.requests.get, nte.requests.post
-        nte.config_logger()
-        nte.config_logger()
-        managed = [h for h in self.root_logger.handlers if getattr(h, '_nte_log_handler', False)]
-        self.assertEqual(len(managed), 1)
-        self.assertIs(nte.requests.get, before_get)
-        self.assertIs(nte.requests.post, before_post)
-        with patch.object(nte.requests, 'get', return_value=make_response(text='raw-body-secret')):
-            nte._request_get(nte.LOGIN_URL + '?token=query-secret', headers={'Authorization': 'header-secret'})
-        managed[0].flush()
-        content = log_path.read_text(encoding='utf-8')
-        self.assertIn('existing log', content)
-        self.assertEqual(content.count('GET user.laohu.com/openApi/sms/new/login status=200'), 1)
-        for secret in ('raw-body-secret', 'query-secret', 'header-secret'):
-            self.assertNotIn(secret, content)
+    def test_http_logs_use_astrbot_logger_and_only_request_metadata(self):
+        framework_logger = Mock(spec=('info', 'warning', 'error', 'exception', 'debug'))
+        module = load_nte_module(framework_logger)
+        self.assertIs(module.logger, framework_logger)
+        url = ('https://username-secret:password-secret@user.laohu.com'
+               '/openApi/sms/new/login?token=query-secret#fragment-secret')
+        for method, arguments in (
+            ('GET', {'params': {'token': 'params-secret'}}),
+            ('POST', {'data': {'token': 'form-secret'}}),
+            ('POST', {'json': {'token': 'json-secret'}}),
+        ):
+            with self.subTest(method=method, body=next(iter(arguments))):
+                framework_logger.reset_mock()
+                response = make_response(text='raw-body-secret', status=202)
+                with patch.object(module.requests, method.lower(), return_value=response):
+                    self.assertIs(module._request(method, url,
+                        headers={'Authorization': 'header-secret'}, **arguments), response)
+                framework_logger.info.assert_called_once_with(
+                    f'{method} user.laohu.com/openApi/sms/new/login status=202')
+                self.assertEqual(len(framework_logger.mock_calls), 1)
+        self.assertFalse(Path('logs').exists())
 
-    def test_rollover_closes_previous_owned_handler(self):
-        fake_date = Mock()
-        fake_date.today.side_effect = [date(2030, 1, 1), date(2030, 1, 2)]
-        with patch.object(nte, 'date', fake_date):
-            nte.config_logger()
-            old_handler = next(h for h in self.root_logger.handlers if getattr(h, '_nte_log_handler', False))
-            nte.config_logger()
-        self.assertIsNone(old_handler.stream)
-        self.assertNotIn(old_handler, self.root_logger.handlers)
-        self.assertEqual(len([h for h in self.root_logger.handlers if getattr(h, '_nte_log_handler', False)]), 1)
+    def test_source_uses_only_astrbot_logger_without_logger_configuration(self):
+        tree = ast.parse((ROOT / 'nte.py').read_text(encoding='utf-8'))
+        imports = [node for node in ast.walk(tree)
+                   if isinstance(node, (ast.Import, ast.ImportFrom))]
+        self.assertTrue(any(isinstance(node, ast.ImportFrom)
+                            and node.module == 'astrbot.api'
+                            and any(alias.name == 'logger' for alias in node.names)
+                            for node in imports))
+        for node in imports:
+            if isinstance(node, ast.Import):
+                self.assertFalse(any(alias.name.split('.')[0] == 'logging'
+                                     for alias in node.names))
+            else:
+                self.assertNotEqual((node.module or '').split('.')[0], 'logging')
+        self.assertFalse(any(isinstance(node, ast.Name) and node.id == 'logging'
+                             for node in ast.walk(tree)))
+        self.assertFalse(hasattr(nte, 'config_logger'))
+        self.assertFalse(any(isinstance(node, ast.Attribute)
+                             and node.attr in ('addHandler', 'removeHandler')
+                             for node in ast.walk(tree)))
+
+    def test_initialization_failure_uses_astrbot_logger_without_creating_logs(self):
+        with patch.object(nte, 'init_token', side_effect=RuntimeError('test initialization failure')), \
+                patch.object(nte, 'logger') as framework_logger, \
+                patch('builtins.print'):
+            self.assertFalse(nte.start())
+        framework_logger.exception.assert_called_once_with('初始化失败')
+        self.assertFalse(Path('logs').exists())
+
+    def test_sign_failure_uses_astrbot_logger_without_creating_logs(self):
+        with patch.object(nte, 'init_token', return_value=[{'refreshToken': 'fake-refresh'}]), \
+                patch.object(nte, 'do_sign', side_effect=RuntimeError('test sign failure')), \
+                patch.object(nte, 'save') as save, \
+                patch.object(nte, 'token_env', 'test-token'), \
+                patch.object(nte, 'logger') as framework_logger, \
+                patch('builtins.print'):
+            self.assertFalse(nte.start())
+        framework_logger.exception.assert_called_once_with('签到失败')
+        save.assert_not_called()
+        self.assertFalse(Path('logs').exists())
 
 
 if __name__ == '__main__':
