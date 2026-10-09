@@ -22,4 +22,4 @@
 - 移除自动跨游戏签到候选，保留显式配置；修复签到结果中全角和半角 `gameId` 文案的清理。
 - 新增覆盖登录状态、接口协议、日志及并发写入的离线回归测试。
 
-`ds` 算法参考：[NTEUID 塔吉多客户端](https://github.com/tyql688/NTEUID/blob/main/NTEUID/utils/sdk/tajiduo.py)、[taygedo-auto-attendance 协议实现](https://github.com/zzstar101/taygedo-auto-attendance/blob/main/src/taygedo/protocol.ts)。业务接口使用模拟响应验证，真实账号登录和签到需由用户更新后确认。
+`ds` 算法参考：[NTEUID 塔吉多客户端](https://github.com/tyql688/NTEUID/blob/main/NTEUID/utils/sdk/tajiduo.py)、[taygedo-auto-attendance 协议实现](https://github.com/zzstar101/taygedo-auto-attendance/blob/main/src/taygedo/protocol.ts)。
