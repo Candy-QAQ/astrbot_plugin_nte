@@ -106,18 +106,7 @@ git clone https://github.com/Candy-QAQ/astrbot_plugin_nte.git
 
 插件依赖已在 `requirements.txt` 中列出，AstrBot 会自动安装。
 
-## 开发验证
-
-安装依赖后可运行离线回归测试，无需启动 AstrBot：
-
-```bash
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
-```
-
-测试使用模拟消息、KV 存储和接口响应，不发送真实短信或请求真实账号接口。更新说明见 [CHANGELOG.md](CHANGELOG.md)。
-
-插件日志统一使用 `astrbot.api.logger`，由 AstrBot 管理输出和日志级别，不自行创建日志文件。单独运行 `nte.py` 也需要可用的 AstrBot 环境；离线回归测试会隔离该依赖。
+更新说明见 [CHANGELOG.md](https://github.com/Candy-QAQ/astrbot_plugin_nte/blob/main/CHANGELOG.md)。
 
 ## 许可
 
