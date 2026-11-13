@@ -25,6 +25,19 @@ def make_response(payload=None, *, text=None, status=200):
 
 
 class NteHttpTests(unittest.TestCase):
+    def test_user_center_login_matches_current_client_headers(self):
+        response = make_response({'code': 0, 'data': {
+            'accessToken': 'fake-access', 'refreshToken': 'fake-refresh',
+        }})
+        with patch.object(nte.requests, 'post', return_value=response) as post:
+            nte.user_center_login('fake-sdk', 'sdk-user', 'device1')
+        headers = post.call_args.kwargs['headers']
+        self.assertEqual(headers['appversion'], '1.2.5')
+        self.assertEqual(headers['uid'], '0')
+        self.assertEqual(headers['debug-uid'], '3')
+        self.assertEqual(headers['deviceid'], 'device1')
+        self.assertRegex(headers['ds'], r'^\d+,[A-Za-z0-9]{8},[0-9a-f]{32}$')
+
     def test_ds_matches_public_protocol_test_vector(self):
         # Reference fixture, independent of this module's default app version:
         # zzstar101/taygedo-auto-attendance/test/protocol.test.ts

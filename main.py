@@ -39,7 +39,7 @@ COMMAND_TEXT_RE = re.compile(
 )
 
 
-@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.2")
+@register(PLUGIN_NAME, "AstrBot", "异环自动签到插件", "1.1.3")
 class NTEPlugin(Star):
     """异环签到插件"""
 
@@ -507,19 +507,37 @@ class NTEPlugin(Star):
             lines.append("详情  无详细信息")
         return "\n".join(lines)
 
-    async def _do_sign_for_account(self, entry: dict) -> tuple[bool, list[str]]:
+    async def _do_sign_for_account(self, entry: dict, persist=None) -> tuple[bool, list[str]]:
         account = copy.deepcopy(entry.get("account") or {})
         if not self._has_usable_credentials(account):
             raise Exception("账号数据缺失，请重新登录")
+        loop = asyncio.get_running_loop()
+
+        def save_refreshed_credentials():
+            if persist is not None:
+                # Wait for KV persistence before the worker sends another request.
+                future = asyncio.run_coroutine_threadsafe(persist(copy.deepcopy(account)), loop)
+                future.result()
 
         def _run_sign():
             output: list[str] = []
-            sign_ok = nte.do_sign(account, output=output.append)
+            sign_ok = nte.do_sign(
+                account, output=output.append, persist=save_refreshed_credentials
+            )
             lines = [line.strip() for text in output for line in text.splitlines() if line.strip()]
             return sign_ok, lines
 
-        ok, details = await asyncio.to_thread(_run_sign)
-        entry["account"] = account
+        worker = asyncio.create_task(asyncio.to_thread(_run_sign))
+        try:
+            ok, details = await asyncio.shield(worker)
+        except asyncio.CancelledError as cancelled:
+            # A cancelled await cannot stop a requests worker that may rotate tokens.
+            try:
+                await worker
+            finally:
+                raise cancelled
+        finally:
+            entry["account"] = account
         entry["last_sign_at"] = datetime.now().isoformat()
         return ok, details
 
@@ -636,10 +654,21 @@ class NTEPlugin(Star):
             before = copy.deepcopy(current)
             entry.clear()
             entry.update(current)
+
+        async def persist_credentials(account):
+            nonlocal before
+            checkpoint = copy.deepcopy(entry)
+            checkpoint["account"] = account
+            if not await self._commit_sign_result(user_keys, before, checkpoint):
+                raise RuntimeError("账号绑定已变更，已停止本次签到")
+            before = copy.deepcopy(checkpoint)
+            entry["account"] = copy.deepcopy(account)
+
         try:
-            result = await self._do_sign_for_account(entry)
-            await self._commit_sign_result(user_keys, before, entry)
-            return result
+            try:
+                return await self._do_sign_for_account(entry, persist=persist_credentials)
+            finally:
+                await self._commit_sign_result(user_keys, before, entry)
         finally:
             async with self._state_lock:
                 self._signing_accounts = {

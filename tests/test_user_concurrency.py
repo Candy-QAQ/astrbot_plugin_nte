@@ -65,7 +65,7 @@ class UserConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await self.bind_initial(self.alice, entries)
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def paused_sign(entry):
+        async def paused_sign(entry, persist=None):
             started.set()
             await release.wait()
             entry["account"]["refreshToken"] = "old-sign-result"
@@ -107,7 +107,7 @@ class UserConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await self.bind_initial(self.alice)
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def paused_sign(entry):
+        async def paused_sign(entry, persist=None):
             started.set()
             await release.wait()
             entry["account"]["refreshToken"] = "stale-refreshed-token"
@@ -156,7 +156,7 @@ class UserConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         started, release = asyncio.Event(), asyncio.Event()
         calls = []
 
-        async def paused_sign(entry):
+        async def paused_sign(entry, persist=None):
             calls.append(entry["phone"])
             if len(calls) == 2:
                 started.set()
@@ -187,7 +187,7 @@ class UserConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await self.bind_initial(self.bob, [self.account_entry(OTHER_PHONE, "bob-old")])
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def paused_sign(entry):
+        async def paused_sign(entry, persist=None):
             started.set()
             await release.wait()
             entry["account"]["refreshToken"] = "alice-fresh"
@@ -212,7 +212,7 @@ class UserConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         started, release = asyncio.Event(), asyncio.Event()
         calls = []
 
-        async def paused_sign(entry):
+        async def paused_sign(entry, persist=None):
             calls.append(entry["phone"])
             started.set()
             await release.wait()
@@ -295,7 +295,7 @@ class UserConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         calls = []
 
-        def account_service(account, *, output):
+        def account_service(account, *, output, persist=None):
             calls.append(account["refreshToken"])
             if len(calls) == 1:
                 loop.call_soon_threadsafe(started.set)

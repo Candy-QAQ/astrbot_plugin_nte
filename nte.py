@@ -39,8 +39,8 @@ DEVICEMODEL = 'LGE-AN10'
 SDKVERSION = '4.129.0'
 BID = 'com.pwrd.htassistant'
 CHANNELID = '1'
-# usercenter/login + refreshToken 对 appversion 校验严格，当前可用值是 1.1.0
-APPVERSION = '1.1.0'
+# Match the user-center protocol used by the current standalone client.
+APPVERSION = '1.2.5'
 # Verified against the public Tajiduo client implementations:
 # https://github.com/tyql688/NTEUID/blob/main/NTEUID/utils/sdk/tajiduo.py
 # https://github.com/zzstar101/taygedo-auto-attendance/blob/main/src/taygedo/protocol.ts
@@ -679,10 +679,12 @@ def login_with_password(phone, password, device_id):
 def user_center_login(token, user_id, device_id):
     headers = {
         **REQUEST_HEADERS_BASE,
+        'Accept': 'application/json, text/plain, */*',
         'deviceid': device_id,
         'authorization': '',
         'appversion': APPVERSION,
-        'uid': '10000000',
+        'uid': '0',
+        'debug-uid': '3',
         'User-Agent': OKHTTP_UA,
     }
     payload = {
@@ -702,10 +704,12 @@ def user_center_login(token, user_id, device_id):
 def refresh_access_token(account):
     headers = {
         **REQUEST_HEADERS_BASE,
+        'Accept': 'application/json, text/plain, */*',
         'deviceid': account['deviceId'],
         'authorization': account['refreshToken'],
         'appversion': APPVERSION,
-        'uid': '10000000',
+        'uid': str(account.get('uid') or '0'),
+        'debug-uid': '3',
         'User-Agent': OKHTTP_UA,
     }
     response = _request_post(REFRESH_TOKEN_URL, headers=headers)
@@ -1171,7 +1175,7 @@ def init_token():
     return selected_accounts
 
 
-def do_sign(account, output=print):
+def do_sign(account, output=print, persist=None):
     account['gameId'] = str(account.get('gameId') or _default_game_id())
     if not account.get('deviceId'):
         account['deviceId'] = _random_device_id()
@@ -1187,6 +1191,8 @@ def do_sign(account, output=print):
 
     if has_tajiduo:
         access_token = refresh_access_token(account)
+        if persist is not None:
+            persist()
         uid = str(account.get('uid') or '').strip()
         if uid:
             app_ok, app_msg = app_signin(access_token, uid, account['deviceId'])
